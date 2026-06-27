@@ -23,24 +23,26 @@ import argparse
 import bisect
 import csv
 import json
+import logging
 import math
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from statistics import median
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Protocol, Tuple
 
 sys.path.insert(0, os.path.dirname(__file__))
-from mt5_readers import (
-    RawDeal, RawCurvePoint,
-    load_xlsx_deals, load_graph_csv, discover_files,
-)
+from mt5_readers import discover_files, load_graph_csv, load_xlsx_deals
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
 # Internal domain types
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class DealEvent:
@@ -80,75 +82,206 @@ class PairData:
     trades: List[TradeEvent]
     curve: List[CurvePoint]
     baseline_volume_median: Optional[float]
+    curve_times: List[datetime] = field(default_factory=list)
+    curve_floating: List[float] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.curve and not self.curve_times:
+            self.curve_times = [p.time for p in self.curve]
+            self.curve_floating = [p.equity - p.balance for p in self.curve]
+
+    def interpolate_floating(self, when: datetime) -> float:
+        if not self.curve:
+            return 0.0
+
+        idx = bisect.bisect_left(self.curve_times, when)
+        if idx <= 0:
+            return self.curve_floating[0]
+        if idx >= len(self.curve_times):
+            return self.curve_floating[-1]
+
+        left_time = self.curve_times[idx - 1]
+        right_time = self.curve_times[idx]
+        left_float = self.curve_floating[idx - 1]
+        right_float = self.curve_floating[idx]
+
+        dt = (right_time - left_time).total_seconds()
+        if dt <= 0:
+            return left_float
+
+        ratio = max(0.0, min(1.0, (when - left_time).total_seconds() / dt))
+        return left_float + (right_float - left_float) * ratio
+
+
+@dataclass
+class Position:
+    pair: str
+    lots: float = 0.0
+    baseline_lots: float = 0.0
+    last_price: Optional[float] = None
+
+
+# ---------------------------------------------------------------------------
+# Configuration types
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ScalingConfig:
+    exponent: float = 1.0
+    min_scale: float = 0.1
+    max_scale: float = 5.0
+
+
+@dataclass
+class PairInputConfig:
+    name: str
+    risk_percent: float
+    base_lot: Optional[float]
+    xlsx_file: str
+    curve_file: Optional[str]
+
+
+@dataclass
+class PortfolioConfig:
+    initial_balance: float
+    scaling: ScalingConfig
+    pairs: List[PairInputConfig]
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _median_volume(deals):
+
+def _median_volume(deals: List[DealEvent]) -> Optional[float]:
     vols = [d.volume for d in deals if d.volume > 0]
     return median(vols) if vols else None
 
 
-def _interpolate_floating(curve, when):
-    if not curve:
-        return 0.0
-    times = [p.time for p in curve]
-    idx = bisect.bisect_left(times, when)
-    if idx <= 0:
-        p = curve[0]; return p.equity - p.balance
-    if idx >= len(curve):
-        p = curve[-1]; return p.equity - p.balance
-    left, right = curve[idx - 1], curve[idx]
-    lf = left.equity - left.balance
-    rf = right.equity - right.balance
-    dt = (right.time - left.time).total_seconds()
-    if dt <= 0:
-        return lf
-    ratio = max(0.0, min(1.0, (when - left.time).total_seconds() / dt))
-    return lf + (rf - lf) * ratio
-
-
-def _balance_scale(balance, initial, exp, lo, hi):
-    raw = (balance / initial) ** exp
-    return max(lo, min(hi, raw))
-
-
-def _max_drawdown(values):
+def _max_drawdown(values: List[float]) -> Tuple[float, float]:
     if not values:
         return 0.0, 0.0
+
     peak = values[0]
-    max_abs = max_pct = 0.0
-    for v in values:
-        if v > peak:
-            peak = v
-        dd = peak - v
+    max_abs = 0.0
+    max_pct = 0.0
+    for value in values:
+        if value > peak:
+            peak = value
+        dd = peak - value
         max_abs = max(max_abs, dd)
         if peak > 0:
             max_pct = max(max_pct, dd / peak)
     return max_abs, max_pct
 
 
+def _interpolate_floating(curve: List[CurvePoint], when: datetime) -> float:
+    """Backward-compatible interpolation helper retained for notebook usage."""
+    if not curve:
+        return 0.0
+
+    times = [point.time for point in curve]
+    values = [point.equity - point.balance for point in curve]
+
+    idx = bisect.bisect_left(times, when)
+    if idx <= 0:
+        return values[0]
+    if idx >= len(times):
+        return values[-1]
+
+    left_time = times[idx - 1]
+    right_time = times[idx]
+    left_value = values[idx - 1]
+    right_value = values[idx]
+    dt = (right_time - left_time).total_seconds()
+    if dt <= 0:
+        return left_value
+
+    ratio = max(0.0, min(1.0, (when - left_time).total_seconds() / dt))
+    return left_value + (right_value - left_value) * ratio
+
+
 def _normalize_pair_key(pair_name: str) -> str:
     return "".join(ch for ch in str(pair_name).upper() if ch.isalpha())
 
 
-def _write_csv(path, rows):
+def _write_csv(path: str, rows: List[Dict[str, object]]) -> None:
     if not rows:
-        open(path, "w").close()
+        open(path, "w", encoding="utf-8").close()
         return
+
     with open(path, "w", encoding="utf-8", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
-        w.writeheader()
-        w.writerows(rows)
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _resolve_abs_path(base_dir: str, rel_or_abs: Optional[str]) -> Optional[str]:
+    if rel_or_abs is None:
+        return None
+    if os.path.isabs(rel_or_abs):
+        return rel_or_abs
+    return os.path.normpath(os.path.join(base_dir, rel_or_abs))
+
+
+def _parse_portfolio_config(config_obj: Dict[str, object], config_dir: str) -> PortfolioConfig:
+    scaling = ScalingConfig(
+        exponent=float(config_obj.get("scale_exponent", 1.0)),
+        min_scale=float(config_obj.get("min_scale", 0.1)),
+        max_scale=float(config_obj.get("max_scale", 5.0)),
+    )
+    if scaling.min_scale <= 0 or scaling.max_scale <= 0:
+        raise ValueError("min_scale and max_scale must be > 0")
+    if scaling.min_scale > scaling.max_scale:
+        raise ValueError("min_scale cannot exceed max_scale")
+
+    pair_items = config_obj.get("pairs", [])
+    if not isinstance(pair_items, list) or not pair_items:
+        raise ValueError("config must include a non-empty 'pairs' list")
+
+    seen = set()
+    pairs: List[PairInputConfig] = []
+    for raw_pair in pair_items:
+        name = str(raw_pair["name"]).strip()
+        if not name:
+            raise ValueError("pair name cannot be empty")
+        if name in seen:
+            raise ValueError(f"Duplicate pair name in config: {name}")
+        seen.add(name)
+
+        xlsx = _resolve_abs_path(config_dir, raw_pair.get("xlsx_file") or raw_pair.get("deals_file"))
+        curve = _resolve_abs_path(config_dir, raw_pair.get("curve_file") or raw_pair.get("csv_file"))
+        if not xlsx or not os.path.exists(xlsx):
+            raise FileNotFoundError(f"xlsx_file not found for {name}: {xlsx}")
+
+        pairs.append(PairInputConfig(
+            name=name,
+            risk_percent=float(raw_pair.get("risk_percent", 0.0)),
+            base_lot=float(raw_pair["base_lot"]) if raw_pair.get("base_lot") is not None else None,
+            xlsx_file=xlsx,
+            curve_file=curve,
+        ))
+
+    initial_balance = float(config_obj.get("initial_balance", 0.0))
+    if initial_balance <= 0:
+        raise ValueError("initial_balance in config must be > 0")
+
+    return PortfolioConfig(initial_balance=initial_balance, scaling=scaling, pairs=pairs)
 
 
 # ---------------------------------------------------------------------------
 # Pair loading
 # ---------------------------------------------------------------------------
 
-def load_pair(name, risk_percent, base_lot, xlsx_path, csv_path=None):
+
+def load_pair(
+    name: str,
+    risk_percent: float,
+    base_lot: Optional[float],
+    xlsx_path: str,
+    csv_path: Optional[str] = None,
+) -> PairData:
     raw_deals, _initial = load_xlsx_deals(xlsx_path, include_open=True)
     trades = [
         TradeEvent(
@@ -170,12 +303,13 @@ def load_pair(name, risk_percent, base_lot, xlsx_path, csv_path=None):
         for d in raw_deals
         if d.direction == "out"
     ]
+
     if csv_path:
         raw_curve = load_graph_csv(csv_path)
-        curve = [CurvePoint(time=p.time, balance=p.balance, equity=p.equity)
-                 for p in raw_curve]
+        curve = [CurvePoint(time=p.time, balance=p.balance, equity=p.equity) for p in raw_curve]
     else:
         curve = []
+
     return PairData(
         config=PairConfig(name=name, risk_percent=risk_percent, base_lot=base_lot),
         deals=deals,
@@ -186,219 +320,455 @@ def load_pair(name, risk_percent, base_lot, xlsx_path, csv_path=None):
 
 
 # ---------------------------------------------------------------------------
+# Position sizing, margin, statistics
+# ---------------------------------------------------------------------------
+
+
+class PositionSizer:
+    """Computes balance scaling and pair-specific lot multipliers."""
+
+    def __init__(self, initial_balance: float, scaling: ScalingConfig):
+        if initial_balance <= 0:
+            raise ValueError("initial_balance must be > 0")
+        self.initial_balance = initial_balance
+        self.scaling = scaling
+
+    def scale_balance(self, balance: float) -> float:
+        # Negative balances are clamped to zero to avoid invalid fractional powers.
+        safe_balance = max(0.0, balance)
+        raw = (safe_balance / self.initial_balance) ** self.scaling.exponent
+        return max(self.scaling.min_scale, min(self.scaling.max_scale, raw))
+
+    @staticmethod
+    def pair_multiplier(pair_data: PairData) -> float:
+        cfg = pair_data.config
+        if cfg.base_lot is not None and pair_data.baseline_volume_median and pair_data.baseline_volume_median > 0:
+            return cfg.base_lot / pair_data.baseline_volume_median
+        return 1.0
+
+    def total_scale(self, pair_data: PairData, balance: float) -> float:
+        return self.scale_balance(balance) * self.pair_multiplier(pair_data)
+
+    def scale_volume(self, pair_data: PairData, balance: float, volume: float) -> float:
+        return volume * self.total_scale(pair_data, balance)
+
+
+class Broker(Protocol):
+    def margin_requirement_percent(self, pair: str) -> float:
+        ...
+
+    def contract_size(self, pair: str) -> float:
+        ...
+
+    def stop_out_level_percent(self) -> Optional[float]:
+        ...
+
+
+@dataclass
+class ForexBroker:
+    margin_requirements: Dict[str, float]
+    default_contract_size: float = 100000.0
+    stop_out_percent: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        self._norm_mmr = {
+            _normalize_pair_key(pair): float(percent)
+            for pair, percent in (self.margin_requirements or {}).items()
+        }
+
+    def margin_requirement_percent(self, pair: str) -> float:
+        return self._norm_mmr.get(_normalize_pair_key(pair), 0.0)
+
+    def contract_size(self, pair: str) -> float:
+        return self.default_contract_size
+
+    def stop_out_level_percent(self) -> Optional[float]:
+        return self.stop_out_percent
+
+
+class MarginCalculator:
+    """Calculates margin-related portfolio metrics from open positions."""
+
+    def __init__(self, broker: Broker):
+        self.broker = broker
+
+    def calculate_used_margin(self, positions: Dict[str, Position]) -> float:
+        used_margin = 0.0
+        for pair, position in positions.items():
+            if position.lots <= 0 or not position.last_price:
+                continue
+            mmr = self.broker.margin_requirement_percent(pair)
+            if mmr <= 0:
+                continue
+            used_margin += (
+                position.lots
+                * self.broker.contract_size(pair)
+                * position.last_price
+                * mmr
+            ) / 100.0
+        return used_margin
+
+    @staticmethod
+    def calculate_free_margin(equity: float, used_margin: float) -> float:
+        return equity - used_margin
+
+    @staticmethod
+    def calculate_margin_level_percent(equity: float, used_margin: float) -> Optional[float]:
+        if used_margin <= 0:
+            return None
+        return (equity / used_margin) * 100.0
+
+
+class PortfolioStatistics:
+    """Transforms simulation traces into summary metrics."""
+
+    @staticmethod
+    def summarize(
+        initial_balance: float,
+        final_balance: float,
+        final_equity: float,
+        equity_values: List[float],
+        margin_level_values: List[float],
+        max_used_margin: float,
+        min_free_margin: Optional[float],
+        event_count: int,
+        start_time: datetime,
+        end_time: datetime,
+        pairs_data: List[PairData],
+        pair_pnl: Dict[str, float],
+    ) -> Dict[str, object]:
+        total_return_pct = (final_balance / initial_balance - 1.0) * 100.0
+        abs_dd, pct_dd = _max_drawdown(equity_values)
+
+        span_days = max((end_time - start_time).total_seconds() / 86400.0, 0.0)
+        years = span_days / 365.25
+        cagr = PortfolioStatistics.calculate_cagr_percent(initial_balance, final_balance, years)
+
+        return {
+            "initial_balance": initial_balance,
+            "final_balance": round(final_balance, 4),
+            "final_equity": round(final_equity, 4),
+            "total_return_percent": round(total_return_pct, 4),
+            "max_drawdown_abs": round(abs_dd, 4),
+            "max_drawdown_percent": round(pct_dd * 100.0, 4),
+            "max_used_margin": round(max_used_margin, 4),
+            "min_free_margin": round(min_free_margin, 4) if min_free_margin is not None else None,
+            "min_margin_level_percent": round(min(margin_level_values), 4) if margin_level_values else None,
+            "cagr_percent": round(cagr, 4),
+            "total_deals": event_count,
+            "period_start": start_time.strftime("%Y.%m.%d %H:%M:%S"),
+            "period_end": end_time.strftime("%Y.%m.%d %H:%M:%S"),
+            "pairs": {
+                pair_data.config.name: {
+                    "risk_percent": pair_data.config.risk_percent,
+                    "configured_base_lot": pair_data.config.base_lot,
+                    "baseline_volume_median": (
+                        round(pair_data.baseline_volume_median, 4)
+                        if pair_data.baseline_volume_median is not None
+                        else None
+                    ),
+                    "scaled_pnl_contribution": round(pair_pnl[pair_data.config.name], 4),
+                    "deals_count": len(pair_data.deals),
+                }
+                for pair_data in pairs_data
+            },
+        }
+
+    @staticmethod
+    def calculate_cagr_percent(initial_balance: float, final_balance: float, years: float) -> float:
+        if years <= 0 or initial_balance <= 0:
+            return 0.0
+        if final_balance <= 0:
+            return -100.0
+
+        growth_ratio = final_balance / initial_balance
+        annual_log_growth = math.log(growth_ratio) / years
+        if annual_log_growth > 700:
+            return float("inf")
+        return (math.exp(annual_log_growth) - 1.0) * 100.0
+
+
+# ---------------------------------------------------------------------------
 # Simulation engine
 # ---------------------------------------------------------------------------
 
+
+class PortfolioSimulator:
+    """Coordinates event replay, equity/margin curve construction, and summary metrics."""
+
+    def __init__(
+        self,
+        pairs_data: List[PairData],
+        initial_balance: float,
+        scaling: ScalingConfig,
+        margin_requirements: Optional[Dict[str, float]] = None,
+        contract_size: float = 100000.0,
+    ):
+        self.pairs_data = pairs_data
+        self.initial_balance = initial_balance
+        self.sizer = PositionSizer(initial_balance, scaling)
+        self.margin_calculator = MarginCalculator(
+            ForexBroker(margin_requirements or {}, default_contract_size=contract_size)
+        )
+        self.statistics = PortfolioStatistics()
+
+        self._validate_inputs()
+
+    def _validate_inputs(self) -> None:
+        if not self.pairs_data:
+            raise ValueError("No pair data provided")
+
+        seen = set()
+        for pair_data in self.pairs_data:
+            name = pair_data.config.name
+            if name in seen:
+                raise ValueError(f"Duplicate pair name in pairs_data: {name}")
+            seen.add(name)
+
+        any_deals = any(pair_data.deals for pair_data in self.pairs_data)
+        if not any_deals:
+            raise ValueError("No deal events loaded from any pair")
+
+    def _build_sorted_deal_events(self) -> List[DealEvent]:
+        all_events: List[DealEvent] = []
+        for pair_data in self.pairs_data:
+            all_events.extend(pair_data.deals)
+        all_events.sort(key=lambda event: event.time)
+        return all_events
+
+    def _build_sorted_trade_events(self) -> List[TradeEvent]:
+        all_trades: List[TradeEvent] = []
+        for pair_data in self.pairs_data:
+            all_trades.extend(pair_data.trades)
+        all_trades.sort(key=lambda trade: trade.time)
+        return all_trades
+
+    def reconstruct_balance(
+        self,
+        pairs_by_name: Dict[str, PairData],
+        all_events: List[DealEvent],
+        start_time: datetime,
+    ) -> Tuple[float, List[Tuple[datetime, float]], List[Dict[str, object]], Dict[str, float]]:
+        balance = self.initial_balance
+        balance_checkpoints: List[Tuple[datetime, float]] = [(start_time, balance)]
+        pair_pnl = {pair_data.config.name: 0.0 for pair_data in self.pairs_data}
+        event_rows: List[Dict[str, object]] = []
+
+        for event in all_events:
+            pair_data = pairs_by_name[event.pair]
+            bscale = self.sizer.scale_balance(balance)
+            pair_mult = self.sizer.pair_multiplier(pair_data)
+            total_scale = bscale * pair_mult
+            scaled_pnl = event.net_profit * total_scale
+
+            balance += scaled_pnl
+            pair_pnl[event.pair] += scaled_pnl
+            balance_checkpoints.append((event.time, balance))
+
+            event_rows.append({
+                "time": event.time.strftime("%Y.%m.%d %H:%M:%S"),
+                "pair": event.pair,
+                "baseline_net_profit": round(event.net_profit, 6),
+                "baseline_volume": round(event.volume, 4),
+                "balance_scale": round(bscale, 6),
+                "pair_multiplier": round(pair_mult, 6),
+                "total_scale": round(total_scale, 6),
+                "scaled_net_profit": round(scaled_pnl, 4),
+                "running_balance": round(balance, 4),
+                "scaled_volume": round(event.volume * total_scale, 4),
+            })
+
+        return balance, balance_checkpoints, event_rows, pair_pnl
+
+    def reconstruct_curve(
+        self,
+        pairs_by_name: Dict[str, PairData],
+        timeline: List[datetime],
+        balance_checkpoints: List[Tuple[datetime, float]],
+        all_trade_events: List[TradeEvent],
+    ) -> Tuple[List[Dict[str, object]], List[float], List[float], float, Optional[float]]:
+        checkpoint_times = [ts for ts, _ in balance_checkpoints]
+        trade_idx = 0
+
+        positions = {
+            pair_data.config.name: Position(pair=pair_data.config.name)
+            for pair_data in self.pairs_data
+        }
+
+        curve_rows: List[Dict[str, object]] = []
+        equity_values: List[float] = []
+        margin_level_values: List[float] = []
+        max_used_margin = 0.0
+        min_free_margin: Optional[float] = None
+
+        for ts in timeline:
+            bal_idx = bisect.bisect_right(checkpoint_times, ts) - 1
+            current_balance = balance_checkpoints[max(bal_idx, 0)][1]
+
+            while trade_idx < len(all_trade_events) and all_trade_events[trade_idx].time <= ts:
+                trade = all_trade_events[trade_idx]
+                trade_pair = pairs_by_name[trade.pair]
+
+                trade_bal_idx = bisect.bisect_right(checkpoint_times, trade.time) - 1
+                trade_balance = balance_checkpoints[max(trade_bal_idx, 0)][1]
+                scaled_volume = self.sizer.scale_volume(trade_pair, trade_balance, trade.volume)
+
+                position = positions[trade.pair]
+                if trade.direction == "in":
+                    position.lots += scaled_volume
+                    position.baseline_lots += trade.volume
+                elif trade.direction == "out":
+                    position.lots = max(0.0, position.lots - scaled_volume)
+                    position.baseline_lots = max(0.0, position.baseline_lots - trade.volume)
+
+                if trade.price > 0:
+                    position.last_price = trade.price
+
+                trade_idx += 1
+
+            floating = 0.0
+            for pair_data in self.pairs_data:
+                position = positions[pair_data.config.name]
+                if position.baseline_lots > 0:
+                    floating_scale = position.lots / position.baseline_lots
+                else:
+                    floating_scale = 0.0
+                floating += (
+                    pair_data.interpolate_floating(ts)
+                    * floating_scale
+                )
+
+            equity = current_balance + floating
+            used_margin = self.margin_calculator.calculate_used_margin(positions)
+            free_margin = self.margin_calculator.calculate_free_margin(equity, used_margin)
+            margin_level = self.margin_calculator.calculate_margin_level_percent(equity, used_margin)
+
+            equity_values.append(equity)
+            if margin_level is not None:
+                margin_level_values.append(margin_level)
+
+            max_used_margin = max(max_used_margin, used_margin)
+            min_free_margin = free_margin if min_free_margin is None else min(min_free_margin, free_margin)
+
+            curve_rows.append({
+                "time": ts.strftime("%Y.%m.%d %H:%M"),
+                "balance": round(current_balance, 4),
+                "floating_pnl": round(floating, 4),
+                "equity": round(equity, 4),
+                "used_margin": round(used_margin, 4),
+                "free_margin": round(free_margin, 4),
+                "margin_level_percent": round(margin_level, 4) if margin_level is not None else "",
+            })
+
+        return curve_rows, equity_values, margin_level_values, max_used_margin, min_free_margin
+
+    def run(self) -> Dict[str, object]:
+        pairs_by_name = {pair_data.config.name: pair_data for pair_data in self.pairs_data}
+
+        all_events = self._build_sorted_deal_events()
+        all_trade_events = self._build_sorted_trade_events()
+
+        all_curve_times = set()
+        for pair_data in self.pairs_data:
+            all_curve_times.update(pair_data.curve_times)
+
+        start_time = min(
+            all_events[0].time,
+            min(all_curve_times) if all_curve_times else all_events[0].time,
+        )
+
+        final_balance, balance_checkpoints, event_rows, pair_pnl = self.reconstruct_balance(
+            pairs_by_name=pairs_by_name,
+            all_events=all_events,
+            start_time=start_time,
+        )
+
+        timeline = sorted(all_curve_times.union({event.time for event in all_events}))
+        if not timeline:
+            timeline = [start_time, balance_checkpoints[-1][0]]
+
+        curve_rows, equity_values, margin_levels, max_used_margin, min_free_margin = self.reconstruct_curve(
+            pairs_by_name=pairs_by_name,
+            timeline=timeline,
+            balance_checkpoints=balance_checkpoints,
+            all_trade_events=all_trade_events,
+        )
+
+        final_equity = equity_values[-1] if equity_values else final_balance
+        end_time = balance_checkpoints[-1][0]
+
+        summary = self.statistics.summarize(
+            initial_balance=self.initial_balance,
+            final_balance=final_balance,
+            final_equity=final_equity,
+            equity_values=equity_values,
+            margin_level_values=margin_levels,
+            max_used_margin=max_used_margin,
+            min_free_margin=min_free_margin,
+            event_count=len(event_rows),
+            start_time=start_time,
+            end_time=end_time,
+            pairs_data=self.pairs_data,
+            pair_pnl=pair_pnl,
+        )
+
+        return {
+            "event_rows": event_rows,
+            "curve_rows": curve_rows,
+            "summary": summary,
+        }
+
+
 def run_simulation(
-    pairs_data,
-    initial_balance,
-    scale_exponent,
-    min_scale,
-    max_scale,
-    margin_requirements=None,
-    contract_size=100000.0,
-):
-    if initial_balance <= 0:
-        raise ValueError("initial_balance must be > 0")
-    if not pairs_data:
-        raise ValueError("No pair data provided")
-
-    all_events = []
-    for pd in pairs_data:
-        all_events.extend(pd.deals)
-    all_events.sort(key=lambda e: e.time)
-
-    if not all_events:
-        raise ValueError("No deal events loaded from any pair")
-
-    all_curve_times = set()
-    for pd in pairs_data:
-        for p in pd.curve:
-            all_curve_times.add(p.time)
-
-    pairs_by_name = {pd.config.name: pd for pd in pairs_data}
-    pair_pnl = {pd.config.name: 0.0 for pd in pairs_data}
-    margin_requirements = margin_requirements or {}
-    margin_req_norm = {
-        _normalize_pair_key(k): float(v)
-        for k, v in margin_requirements.items()
-    }
-
-    start_time = min(all_events[0].time,
-                     min(all_curve_times) if all_curve_times else all_events[0].time)
-
-    balance = initial_balance
-    balance_checkpoints = [(start_time, balance)]
-    event_rows = []
-
-    for event in all_events:
-        pd = pairs_by_name[event.pair]
-        bscale = _balance_scale(balance, initial_balance, scale_exponent, min_scale, max_scale)
-        cfg = pd.config
-        if cfg.base_lot is not None and pd.baseline_volume_median and pd.baseline_volume_median > 0:
-            pair_mult = cfg.base_lot / pd.baseline_volume_median
-        else:
-            pair_mult = 1.0
-        total_scale = bscale * pair_mult
-        scaled_pnl = event.net_profit * total_scale
-        balance += scaled_pnl
-        pair_pnl[event.pair] += scaled_pnl
-        balance_checkpoints.append((event.time, balance))
-        event_rows.append({
-            "time": event.time.strftime("%Y.%m.%d %H:%M:%S"),
-            "pair": event.pair,
-            "baseline_net_profit": round(event.net_profit, 6),
-            "baseline_volume": round(event.volume, 4),
-            "balance_scale": round(bscale, 6),
-            "pair_multiplier": round(pair_mult, 6),
-            "total_scale": round(total_scale, 6),
-            "scaled_net_profit": round(scaled_pnl, 4),
-            "running_balance": round(balance, 4),
-            "scaled_volume": round(event.volume * total_scale, 4),
-        })
-
-    # Build combined curve on union timeline
-    timeline = sorted(all_curve_times.union({e.time for e in all_events}))
-    if not timeline:
-        timeline = [start_time, balance_checkpoints[-1][0]]
-
-    checkpoint_times = [ts for ts, _ in balance_checkpoints]
-    all_trade_events = []
-    for pd in pairs_data:
-        all_trade_events.extend(pd.trades)
-    all_trade_events.sort(key=lambda e: e.time)
-    trade_idx = 0
-
-    open_lots = {pd.config.name: 0.0 for pd in pairs_data}
-    last_price = {pd.config.name: None for pd in pairs_data}
-
-    curve_rows = []
-    equity_values = []
-    margin_level_values = []
-    max_used_margin = 0.0
-    min_free_margin = None
-
-    for ts in timeline:
-        idx = bisect.bisect_right(checkpoint_times, ts) - 1
-        cur_bal = balance_checkpoints[max(idx, 0)][1]
-        bscale = _balance_scale(cur_bal, initial_balance, scale_exponent, min_scale, max_scale)
-
-        while trade_idx < len(all_trade_events) and all_trade_events[trade_idx].time <= ts:
-            tr = all_trade_events[trade_idx]
-            tr_pd = pairs_by_name[tr.pair]
-            tr_idx = bisect.bisect_right(checkpoint_times, tr.time) - 1
-            tr_bal = balance_checkpoints[max(tr_idx, 0)][1]
-            tr_bscale = _balance_scale(tr_bal, initial_balance, scale_exponent, min_scale, max_scale)
-            if tr_pd.config.base_lot is not None and tr_pd.baseline_volume_median and tr_pd.baseline_volume_median > 0:
-                tr_pm = tr_pd.config.base_lot / tr_pd.baseline_volume_median
-            else:
-                tr_pm = 1.0
-            scaled_volume = tr.volume * tr_bscale * tr_pm
-            if tr.direction == "in":
-                open_lots[tr.pair] += scaled_volume
-            elif tr.direction == "out":
-                open_lots[tr.pair] = max(0.0, open_lots[tr.pair] - scaled_volume)
-            if tr.price > 0:
-                last_price[tr.pair] = tr.price
-            trade_idx += 1
-
-        floating = 0.0
-        for pd in pairs_data:
-            cfg = pd.config
-            if cfg.base_lot is not None and pd.baseline_volume_median and pd.baseline_volume_median > 0:
-                pm = cfg.base_lot / pd.baseline_volume_median
-            else:
-                pm = 1.0
-            floating += _interpolate_floating(pd.curve, ts) * bscale * pm
-        equity = cur_bal + floating  # Allow negative equity to show full floating PnL impact
-
-        used_margin = 0.0
-        for pd in pairs_data:
-            pair = pd.config.name
-            pair_key = _normalize_pair_key(pair)
-            mmr_percent = margin_req_norm.get(pair_key, 0.0)
-            price = last_price.get(pair)
-            lots = max(0.0, open_lots.get(pair, 0.0))
-            if lots <= 0 or not price or mmr_percent <= 0:
-                continue
-            used_margin += (lots * contract_size * price * mmr_percent) / 100.0
-
-        free_margin = equity - used_margin
-        margin_level = (equity / used_margin) * 100.0 if used_margin > 0 else None
-
-        equity_values.append(equity)
-        if margin_level is not None:
-            margin_level_values.append(margin_level)
-        max_used_margin = max(max_used_margin, used_margin)
-        min_free_margin = free_margin if min_free_margin is None else min(min_free_margin, free_margin)
-
-        curve_rows.append({
-            "time": ts.strftime("%Y.%m.%d %H:%M"),
-            "balance": round(cur_bal, 4),
-            "floating_pnl": round(floating, 4),
-            "equity": round(equity, 4),
-            "used_margin": round(used_margin, 4),
-            "free_margin": round(free_margin, 4),
-            "margin_level_percent": round(margin_level, 4) if margin_level is not None else "",
-        })
-
-    final_balance = balance
-    final_equity = equity_values[-1] if equity_values else final_balance
-    total_return_pct = (final_balance / initial_balance - 1.0) * 100.0
-    abs_dd, pct_dd = _max_drawdown(equity_values)
-    end_time = balance_checkpoints[-1][0]
-    span_days = max((end_time - start_time).total_seconds() / 86400.0, 0.0)
-    years = span_days / 365.25
-    cagr = ((final_balance / initial_balance) ** (1.0 / years) - 1.0) * 100.0 if years > 0 else 0.0
-
-    summary = {
-        "initial_balance": initial_balance,
-        "final_balance": round(final_balance, 4),
-        "final_equity": round(final_equity, 4),
-        "total_return_percent": round(total_return_pct, 4),
-        "max_drawdown_abs": round(abs_dd, 4),
-        "max_drawdown_percent": round(pct_dd * 100.0, 4),
-        "max_used_margin": round(max_used_margin, 4),
-        "min_free_margin": round(min_free_margin, 4) if min_free_margin is not None else None,
-        "min_margin_level_percent": round(min(margin_level_values), 4) if margin_level_values else None,
-        "cagr_percent": round(cagr, 4),
-        "total_deals": len(event_rows),
-        "period_start": start_time.strftime("%Y.%m.%d %H:%M:%S"),
-        "period_end": end_time.strftime("%Y.%m.%d %H:%M:%S"),
-        "pairs": {
-            pd.config.name: {
-                "risk_percent": pd.config.risk_percent,
-                "configured_base_lot": pd.config.base_lot,
-                "baseline_volume_median": round(pd.baseline_volume_median, 4) if pd.baseline_volume_median is not None else None,
-                "scaled_pnl_contribution": round(pair_pnl[pd.config.name], 4),
-                "deals_count": len(pd.deals),
-            }
-            for pd in pairs_data
-        },
-    }
-
-    return {"event_rows": event_rows, "curve_rows": curve_rows, "summary": summary}
+    pairs_data: List[PairData],
+    initial_balance: float,
+    scale_exponent: float,
+    min_scale: float,
+    max_scale: float,
+    margin_requirements: Optional[Dict[str, float]] = None,
+    contract_size: float = 100000.0,
+) -> Dict[str, object]:
+    """Backward-compatible API kept for notebook and CLI callers."""
+    simulator = PortfolioSimulator(
+        pairs_data=pairs_data,
+        initial_balance=initial_balance,
+        scaling=ScalingConfig(scale_exponent, min_scale, max_scale),
+        margin_requirements=margin_requirements,
+        contract_size=contract_size,
+    )
+    return simulator.run()
 
 
 # ---------------------------------------------------------------------------
 # Default per-pair settings (used in --auto mode)
 # ---------------------------------------------------------------------------
 
+
 _PAIR_RISK = {"EURUSD": 3.3, "EURGBP": 1.2, "GBPUSD": 2.0, "USDCHF": 1.5}
 _PAIR_BASE_LOT = {"EURUSD": None, "EURGBP": None, "GBPUSD": None, "USDCHF": None}
 
 
-def build_pairs_from_auto(data_dir, pair_risk, pair_base_lot):
+def build_pairs_from_auto(
+    data_dir: str,
+    pair_risk: Dict[str, float],
+    pair_base_lot: Dict[str, Optional[float]],
+) -> List[PairData]:
     discovered = discover_files(data_dir)
-    pairs_data = []
+    pairs_data: List[PairData] = []
+
     for pair, files in discovered.items():
         xlsx = files.get("xlsx")
         csv_path = files.get("csv")
         if not xlsx:
-            print(f"  WARNING: no XLSX found for {pair}, skipping.")
+            logger.warning("No XLSX found for %s, skipping", pair)
             continue
-        print(f"  {pair}: xlsx={os.path.basename(xlsx)}"
-              f"  csv={os.path.basename(csv_path) if csv_path else 'none'}")
+
+        logger.info(
+            "%s: xlsx=%s  csv=%s",
+            pair,
+            os.path.basename(xlsx),
+            os.path.basename(csv_path) if csv_path else "none",
+        )
         pairs_data.append(load_pair(
             name=pair,
             risk_percent=pair_risk.get(pair, 0.0),
@@ -406,28 +776,25 @@ def build_pairs_from_auto(data_dir, pair_risk, pair_base_lot):
             xlsx_path=xlsx,
             csv_path=csv_path,
         ))
+
     return pairs_data
 
 
-def build_pairs_from_config(config, config_dir):
-    def abs_path(rel):
-        if rel is None: return None
-        return rel if os.path.isabs(rel) else os.path.normpath(os.path.join(config_dir, rel))
-    pairs_data = []
-    for p in config.get("pairs", []):
-        name = str(p["name"]).strip()
-        xlsx = abs_path(p.get("xlsx_file") or p.get("deals_file"))
-        csv_path = abs_path(p.get("curve_file") or p.get("csv_file"))
-        if not xlsx or not os.path.exists(xlsx):
-            raise FileNotFoundError(f"xlsx_file not found for {name}: {xlsx}")
-        print(f"  {name}: xlsx={os.path.basename(xlsx)}"
-              f"  csv={os.path.basename(csv_path) if csv_path else 'none'}")
+def build_pairs_from_config(config: PortfolioConfig) -> List[PairData]:
+    pairs_data: List[PairData] = []
+    for pair in config.pairs:
+        logger.info(
+            "%s: xlsx=%s  csv=%s",
+            pair.name,
+            os.path.basename(pair.xlsx_file),
+            os.path.basename(pair.curve_file) if pair.curve_file else "none",
+        )
         pairs_data.append(load_pair(
-            name=name,
-            risk_percent=float(p.get("risk_percent", 0.0)),
-            base_lot=float(p["base_lot"]) if p.get("base_lot") is not None else None,
-            xlsx_path=xlsx,
-            csv_path=csv_path,
+            name=pair.name,
+            risk_percent=pair.risk_percent,
+            base_lot=pair.base_lot,
+            xlsx_path=pair.xlsx_file,
+            csv_path=pair.curve_file,
         ))
     return pairs_data
 
@@ -436,97 +803,107 @@ def build_pairs_from_config(config, config_dir):
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="MT5 portfolio analyzer -- reconstructs combined portfolio from "
-                    "separate pair backtests with dynamic lot scaling."
+        description=(
+            "MT5 portfolio analyzer -- reconstructs combined portfolio from "
+            "separate pair backtests with dynamic lot scaling."
+        )
     )
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--auto", action="store_true",
-                      help="Auto-discover XLSX + CSV files in --data-dir")
-    mode.add_argument("--config", metavar="CONFIG_JSON",
-                      help="Path to JSON config file")
-    parser.add_argument("--data-dir", default="data",
-                        help="Data directory (used with --auto)")
-    parser.add_argument("--output-dir", required=True,
-                        help="Directory for output files")
+    mode.add_argument("--auto", action="store_true", help="Auto-discover XLSX + CSV files in --data-dir")
+    mode.add_argument("--config", metavar="CONFIG_JSON", help="Path to JSON config file")
+
+    parser.add_argument("--data-dir", default="data", help="Data directory (used with --auto)")
+    parser.add_argument("--output-dir", required=True, help="Directory for output files")
     parser.add_argument("--initial-balance", type=float, default=None)
     parser.add_argument("--scale-exponent", type=float, default=1.0)
     parser.add_argument("--min-scale", type=float, default=0.1)
     parser.add_argument("--max-scale", type=float, default=5.0)
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
+
+    logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s %(message)s")
 
     output_dir = os.path.abspath(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
-    print("Loading pair data...")
+    logger.info("Loading pair data...")
+
     if args.auto:
         data_dir = os.path.abspath(args.data_dir)
         pairs_data = build_pairs_from_auto(data_dir, _PAIR_RISK, _PAIR_BASE_LOT)
+
+        if args.initial_balance is not None:
+            initial_balance = args.initial_balance
+        else:
+            discovered = discover_files(data_dir)
+            first_xlsx = next((item.get("xlsx") for item in discovered.values() if item.get("xlsx")), None)
+            if not first_xlsx:
+                raise FileNotFoundError(
+                    f"No XLSX files found in {data_dir}. Cannot infer initial balance."
+                )
+            _, initial_balance = load_xlsx_deals(first_xlsx)
+            logger.info("initial_balance from XLSX: %s", initial_balance)
+
+        scaling = ScalingConfig(args.scale_exponent, args.min_scale, args.max_scale)
     else:
         config_path = os.path.abspath(args.config)
         with open(config_path, encoding="utf-8") as fh:
-            config = json.load(fh)
-        pairs_data = build_pairs_from_config(config, os.path.dirname(config_path))
+            cfg_obj = json.load(fh)
+        parsed_config = _parse_portfolio_config(cfg_obj, os.path.dirname(config_path))
+
+        pairs_data = build_pairs_from_config(parsed_config)
+        initial_balance = args.initial_balance if args.initial_balance is not None else parsed_config.initial_balance
+
+        scaling = ScalingConfig(
+            args.scale_exponent if args.scale_exponent != 1.0 else parsed_config.scaling.exponent,
+            args.min_scale if args.min_scale != 0.1 else parsed_config.scaling.min_scale,
+            args.max_scale if args.max_scale != 5.0 else parsed_config.scaling.max_scale,
+        )
 
     if not pairs_data:
-        print("ERROR: No pair data loaded.", file=sys.stderr)
-        sys.exit(1)
+        raise ValueError("No pair data loaded")
 
-    # Resolve initial balance
-    if args.initial_balance is not None:
-        initial_balance = args.initial_balance
-    elif not args.auto and args.config:
-        with open(os.path.abspath(args.config), encoding="utf-8") as fh:
-            cfg = json.load(fh)
-        initial_balance = float(cfg.get("initial_balance", 0.0))
-        if initial_balance <= 0:
-            raise ValueError("initial_balance in config must be > 0")
-    else:
-        data_dir = os.path.abspath(args.data_dir)
-        first_xlsx = next(
-            (v["xlsx"] for v in discover_files(data_dir).values() if "xlsx" in v), None
-        )
-        _, initial_balance = load_xlsx_deals(first_xlsx)
-        print(f"  initial_balance from XLSX: {initial_balance}")
+    logger.info(
+        "Running simulation: initial_balance=%s scale_exp=%s min=%s max=%s",
+        initial_balance,
+        scaling.exponent,
+        scaling.min_scale,
+        scaling.max_scale,
+    )
 
-    scale_exp = args.scale_exponent
-    min_sc    = args.min_scale
-    max_sc    = args.max_scale
-    if not args.auto and args.config:
-        with open(os.path.abspath(args.config), encoding="utf-8") as fh:
-            cfg = json.load(fh)
-        scale_exp = float(cfg.get("scale_exponent", scale_exp))
-        min_sc    = float(cfg.get("min_scale",     min_sc))
-        max_sc    = float(cfg.get("max_scale",     max_sc))
+    result = run_simulation(
+        pairs_data=pairs_data,
+        initial_balance=initial_balance,
+        scale_exponent=scaling.exponent,
+        min_scale=scaling.min_scale,
+        max_scale=scaling.max_scale,
+    )
 
-    print(f"\nRunning simulation: initial_balance={initial_balance} "
-          f"scale_exp={scale_exp} min={min_sc} max={max_sc}")
-
-    result = run_simulation(pairs_data, initial_balance, scale_exp, min_sc, max_sc)
-
-    events_path  = os.path.join(output_dir, "combined_events.csv")
-    curve_path   = os.path.join(output_dir, "combined_curve.csv")
+    events_path = os.path.join(output_dir, "combined_events.csv")
+    curve_path = os.path.join(output_dir, "combined_curve.csv")
     summary_path = os.path.join(output_dir, "summary.json")
 
     _write_csv(events_path, result["event_rows"])
-    _write_csv(curve_path,  result["curve_rows"])
+    _write_csv(curve_path, result["curve_rows"])
     with open(summary_path, "w", encoding="utf-8") as fh:
         json.dump(result["summary"], fh, indent=2)
 
-    s = result["summary"]
-    print(f"\n--- Results ---")
-    print(f"  Period:          {s['period_start']}  to  {s['period_end']}")
-    print(f"  Deals replayed:  {s['total_deals']}")
-    print(f"  Final balance:   {s['final_balance']:,.2f}")
-    print(f"  Total return:    {s['total_return_percent']:.2f}%")
-    print(f"  Max DD (equity): {s['max_drawdown_percent']:.2f}%  ({s['max_drawdown_abs']:,.2f})")
-    print(f"  CAGR:            {s['cagr_percent']:.2f}%")
-    print(f"\n  Per-pair contribution:")
-    for pair, info in s["pairs"].items():
-        print(f"    {pair}: {info['scaled_pnl_contribution']:+,.2f}  "
-              f"({info['deals_count']} deals, median_vol={info['baseline_volume_median']})")
-    print(f"\nOutput written to: {output_dir}")
+    summary = result["summary"]
+    logger.info("--- Results ---")
+    logger.info("Period:          %s  to  %s", summary["period_start"], summary["period_end"])
+    logger.info("Deals replayed:  %s", summary["total_deals"])
+    logger.info("Final balance:   %s", f"{summary['final_balance']:,.2f}")
+    logger.info("Total return:    %s%%", f"{summary['total_return_percent']:.2f}")
+    logger.info(
+        "Max DD (equity): %s%%  (%s)",
+        f"{summary['max_drawdown_percent']:.2f}",
+        f"{summary['max_drawdown_abs']:,.2f}",
+    )
+    logger.info("CAGR:            %s%%", f"{summary['cagr_percent']:.2f}")
+    logger.info("Output written to: %s", output_dir)
 
 
 if __name__ == "__main__":

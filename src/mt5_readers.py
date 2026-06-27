@@ -21,6 +21,7 @@ Two file types are supported:
 """
 
 import csv
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -42,6 +43,9 @@ _MT5_TIME_FORMATS = [
     "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%d %H:%M",
 ]
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -178,40 +182,42 @@ def load_graph_csv(path: str) -> List[RawCurvePoint]:
     Returns curve points sorted chronologically.
     """
     points: List[RawCurvePoint] = []
+    skipped_rows = 0
 
     with open(path, encoding="utf-16", newline="") as handle:
         reader = csv.reader(handle, delimiter="\t")
         header = None
+        date_col = bal_col = eq_col = None
         for row in reader:
             if header is None:
                 # Normalise header: strip < > and whitespace, lower-case
                 header = [c.strip().strip("<>").lower().replace(" ", "_") for c in row]
+                col = {name: idx for idx, name in enumerate(header)}
+                date_col = col.get("date")
+                bal_col = col.get("balance")
+                eq_col = col.get("equity")
+
+                if date_col is None or bal_col is None or eq_col is None:
+                    # Header mapping failed; try positional fallback (DATE BAL EQ ...)
+                    date_col, bal_col, eq_col = 0, 1, 2
                 continue
 
             if len(row) < 3:
+                skipped_rows += 1
                 continue
-
-            col = {name: idx for idx, name in enumerate(header)}
-            date_col = col.get("date")
-            bal_col  = col.get("balance")
-            eq_col   = col.get("equity")
-
-            if date_col is None or bal_col is None or eq_col is None:
-                # Header mapping failed; try positional fallback (DATE BAL EQ ...)
-                date_col, bal_col, eq_col = 0, 1, 2
 
             try:
                 ts  = _parse_mt5_time(row[date_col])
                 bal = float(row[bal_col].replace(",", ""))
                 eq  = float(row[eq_col].replace(",", ""))
             except (ValueError, IndexError):
+                skipped_rows += 1
                 continue
 
             points.append(RawCurvePoint(time=ts, balance=bal, equity=eq))
 
-    # The column resolution above is inside the loop; fix: compute once outside.
-    # The current code re-computes col each row but always from the same header —
-    # that works correctly, just slightly inefficient.  No functional bug.
+    if skipped_rows > 0:
+        logger.warning("Skipped %s malformed curve rows while reading %s", skipped_rows, path)
 
     points.sort(key=lambda p: p.time)
     return points
@@ -235,13 +241,23 @@ def discover_files(data_dir: str):
     {xlsx: path, csv: path}.  Matches are case-insensitive substring search.
     """
     found = {p: {} for p in _PAIR_ALIASES.values()}
-    for fname in os.listdir(data_dir):
+    for fname in sorted(os.listdir(data_dir)):
         lower = fname.lower()
         fpath = os.path.join(data_dir, fname)
         for alias, pair in _PAIR_ALIASES.items():
             if alias in lower:
                 if lower.endswith(".xlsx"):
+                    if "xlsx" in found[pair] and found[pair]["xlsx"] != fpath:
+                        raise ValueError(
+                            f"Multiple XLSX files matched for {pair} in {data_dir}: "
+                            f"{os.path.basename(found[pair]['xlsx'])}, {fname}"
+                        )
                     found[pair]["xlsx"] = fpath
                 elif lower.endswith(".csv"):
+                    if "csv" in found[pair] and found[pair]["csv"] != fpath:
+                        raise ValueError(
+                            f"Multiple CSV files matched for {pair} in {data_dir}: "
+                            f"{os.path.basename(found[pair]['csv'])}, {fname}"
+                        )
                     found[pair]["csv"] = fpath
     return found
