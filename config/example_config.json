@@ -1,0 +1,36 @@
+{
+  "initial_balance": 5000,
+  "scale_exponent": 1.0,
+  "min_scale": 0.1,
+  "max_scale": 5.0,
+  "pairs": [
+    {
+      "name": "EURUSD",
+      "risk_percent": 3.3,
+      "base_lot": null,
+      "xlsx_file": "../data/ReportTester-24886112eurusd4.xlsx",
+      "curve_file": "../data/testergraph.report.2026.06.05_eurusd4.csv"
+    },
+    {
+      "name": "EURGBP",
+      "risk_percent": 1.2,
+      "base_lot": null,
+      "xlsx_file": "../data/ReportTester-24886112eurgbp4.xlsx",
+      "curve_file": "../data/testergraph.report.2026.06.05_eurgbp4.csv"
+    },
+    {
+      "name": "GBPUSD",
+      "risk_percent": 2.0,
+      "base_lot": null,
+      "xlsx_file": "../data/ReportTester-24886112gbpusd4-500grid.xlsx",
+      "curve_file": "../data/testergraph.report.2026.06.05_gbpusd4_500grid.csv"
+    },
+    {
+      "name": "USDCHF",
+      "risk_percent": 1.5,
+      "base_lot": null,
+      "xlsx_file": "../data/ReportTester-24886112usdchf4.xlsx",
+      "curve_file": "../data/testergraph.report.2026.06.05_usdchf4.csv"
+    }
+  ]
+}

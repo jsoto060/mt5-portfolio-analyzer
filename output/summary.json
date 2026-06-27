@@ -1,0 +1,42 @@
+{
+  "initial_balance": 5000.0,
+  "final_balance": 154949.6984,
+  "final_equity": 154949.6984,
+  "total_return_percent": 2998.994,
+  "max_drawdown_abs": 36376.7037,
+  "max_drawdown_percent": 134.8302,
+  "cagr_percent": 172.7311,
+  "total_deals": 2461,
+  "period_start": "2023.01.02 00:00:00",
+  "period_end": "2026.06.04 23:59:58",
+  "pairs": {
+    "EURUSD": {
+      "risk_percent": 3.3,
+      "configured_base_lot": null,
+      "baseline_volume_median": 0.35,
+      "scaled_pnl_contribution": 86010.6144,
+      "deals_count": 336
+    },
+    "EURGBP": {
+      "risk_percent": 1.2,
+      "configured_base_lot": null,
+      "baseline_volume_median": 0.07,
+      "scaled_pnl_contribution": 9739.7547,
+      "deals_count": 601
+    },
+    "GBPUSD": {
+      "risk_percent": 2.0,
+      "configured_base_lot": null,
+      "baseline_volume_median": 0.15,
+      "scaled_pnl_contribution": 26954.9406,
+      "deals_count": 446
+    },
+    "USDCHF": {
+      "risk_percent": 1.5,
+      "configured_base_lot": null,
+      "baseline_volume_median": 0.11,
+      "scaled_pnl_contribution": 27244.3886,
+      "deals_count": 1078
+    }
+  }
+}
