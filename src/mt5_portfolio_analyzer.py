@@ -8,11 +8,10 @@ Input files (per pair):
   - testergraph.report.*.csv -- UTF-16 tab-delimited balance/equity curve.
 
 Dynamic lot scaling:
-  scale = clamp((combined_balance / initial_balance) ^ scale_exponent,
-                min_scale, max_scale)
+    new_lot = round(combined_balance * pair_risk_percent / 100000, 2)
 
 Per-pair PnL is multiplied by:
-  total_scale = balance_scale * (configured_base_lot / median_deal_volume)
+    scale_factor = new_lot / original_lot
 
 Usage:
   python src/mt5_portfolio_analyzer.py --auto --data-dir data --output-dir output
@@ -26,6 +25,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -59,6 +59,7 @@ class TradeEvent:
     direction: str
     volume: float
     price: float
+    side: str = ""
 
 
 @dataclass
@@ -84,6 +85,8 @@ class PairData:
     baseline_volume_median: Optional[float]
     curve_times: List[datetime] = field(default_factory=list)
     curve_floating: List[float] = field(default_factory=list)
+    market_times: List[datetime] = field(default_factory=list)
+    market_close: List[float] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.curve and not self.curve_times:
@@ -112,12 +115,21 @@ class PairData:
         ratio = max(0.0, min(1.0, (when - left_time).total_seconds() / dt))
         return left_float + (right_float - left_float) * ratio
 
+    def market_price_at(self, when: datetime) -> Optional[float]:
+        if not self.market_times:
+            return None
+        idx = bisect.bisect_right(self.market_times, when) - 1
+        if idx < 0:
+            return None
+        return self.market_close[idx]
+
 
 @dataclass
 class Position:
     pair: str
-    lots: float = 0.0
-    baseline_lots: float = 0.0
+    side: str
+    lots: float
+    entry_price: float
     last_price: Optional[float] = None
 
 
@@ -140,6 +152,7 @@ class PairInputConfig:
     base_lot: Optional[float]
     xlsx_file: str
     curve_file: Optional[str]
+    market_file: Optional[str]
 
 
 @dataclass
@@ -225,6 +238,58 @@ def _resolve_abs_path(base_dir: str, rel_or_abs: Optional[str]) -> Optional[str]
     return os.path.normpath(os.path.join(base_dir, rel_or_abs))
 
 
+def _load_m1_market_csv(path: str) -> Tuple[List[datetime], List[float]]:
+    """Load MT5 candle export (<DATE> <TIME> <CLOSE>) as sorted series."""
+    times: List[datetime] = []
+    closes: List[float] = []
+    with open(path, encoding="utf-8", newline="") as fh:
+        reader = csv.reader(fh, delimiter="\t")
+        header = None
+        date_idx = time_idx = close_idx = None
+        for row in reader:
+            if not row:
+                continue
+            if header is None:
+                header = [c.strip().strip("<>").upper() for c in row]
+                idx = {name: i for i, name in enumerate(header)}
+                date_idx = idx.get("DATE")
+                time_idx = idx.get("TIME")
+                close_idx = idx.get("CLOSE")
+                if date_idx is None or time_idx is None or close_idx is None:
+                    raise ValueError(f"Market CSV missing DATE/TIME/CLOSE columns: {path}")
+                continue
+
+            try:
+                ts = datetime.strptime(f"{row[date_idx]} {row[time_idx]}", "%Y.%m.%d %H:%M:%S")
+                close = float(row[close_idx])
+            except (ValueError, IndexError):
+                continue
+            times.append(ts)
+            closes.append(close)
+    return times, closes
+
+
+def discover_reference_price_files(reference_dir: str) -> Dict[str, str]:
+    """Discover pair->market price file mapping (M1/M5/M15/etc.) from reference directory."""
+    aliases = {
+        "eurusd": "EURUSD",
+        "eurgbp": "EURGBP",
+        "gbpusd": "GBPUSD",
+        "usdchf": "USDCHF",
+    }
+    found: Dict[str, str] = {}
+    for fname in sorted(os.listdir(reference_dir)):
+        lower = fname.lower()
+        if not lower.endswith(".csv") or re.search(r"_m\d+_", lower) is None:
+            continue
+        for alias, pair in aliases.items():
+            if alias in lower:
+                if pair in found and found[pair] != os.path.join(reference_dir, fname):
+                    raise ValueError(f"Multiple market timeframe files matched for {pair} in {reference_dir}")
+                found[pair] = os.path.join(reference_dir, fname)
+    return found
+
+
 def _parse_portfolio_config(config_obj: Dict[str, object], config_dir: str) -> PortfolioConfig:
     scaling = ScalingConfig(
         exponent=float(config_obj.get("scale_exponent", 1.0)),
@@ -261,6 +326,7 @@ def _parse_portfolio_config(config_obj: Dict[str, object], config_dir: str) -> P
             base_lot=float(raw_pair["base_lot"]) if raw_pair.get("base_lot") is not None else None,
             xlsx_file=xlsx,
             curve_file=curve,
+            market_file=_resolve_abs_path(config_dir, raw_pair.get("market_file")),
         ))
 
     initial_balance = float(config_obj.get("initial_balance", 0.0))
@@ -281,6 +347,7 @@ def load_pair(
     base_lot: Optional[float],
     xlsx_path: str,
     csv_path: Optional[str] = None,
+    market_csv_path: Optional[str] = None,
 ) -> PairData:
     raw_deals, _initial = load_xlsx_deals(xlsx_path, include_open=True)
     trades = [
@@ -288,6 +355,7 @@ def load_pair(
             time=d.time,
             pair=name,
             direction=d.direction,
+            side=d.side,
             volume=d.volume,
             price=d.price,
         )
@@ -310,12 +378,19 @@ def load_pair(
     else:
         curve = []
 
+    market_times: List[datetime] = []
+    market_close: List[float] = []
+    if market_csv_path and os.path.exists(market_csv_path):
+        market_times, market_close = _load_m1_market_csv(market_csv_path)
+
     return PairData(
         config=PairConfig(name=name, risk_percent=risk_percent, base_lot=base_lot),
         deals=deals,
         trades=trades,
         curve=curve,
         baseline_volume_median=_median_volume(deals),
+        market_times=market_times,
+        market_close=market_close,
     )
 
 
@@ -325,7 +400,7 @@ def load_pair(
 
 
 class PositionSizer:
-    """Computes balance scaling and pair-specific lot multipliers."""
+    """Computes combined-portfolio lot and per-trade scale factors."""
 
     def __init__(self, initial_balance: float, scaling: ScalingConfig):
         if initial_balance <= 0:
@@ -333,24 +408,21 @@ class PositionSizer:
         self.initial_balance = initial_balance
         self.scaling = scaling
 
-    def scale_balance(self, balance: float) -> float:
-        # Negative balances are clamped to zero to avoid invalid fractional powers.
-        safe_balance = max(0.0, balance)
-        raw = (safe_balance / self.initial_balance) ** self.scaling.exponent
-        return max(self.scaling.min_scale, min(self.scaling.max_scale, raw))
-
     @staticmethod
-    def pair_multiplier(pair_data: PairData) -> float:
-        cfg = pair_data.config
-        if cfg.base_lot is not None and pair_data.baseline_volume_median and pair_data.baseline_volume_median > 0:
-            return cfg.base_lot / pair_data.baseline_volume_median
-        return 1.0
+    def compute_new_lot(pair_data: PairData, combined_balance: float) -> float:
+        """Lot sizing rule requested by user: round(balance * risk% / 100000, 2)."""
+        safe_balance = max(0.0, combined_balance)
+        risk_percent = max(0.0, float(pair_data.config.risk_percent or 0.0))
+        return round(safe_balance * risk_percent / 100000.0, 2)
 
-    def total_scale(self, pair_data: PairData, balance: float) -> float:
-        return self.scale_balance(balance) * self.pair_multiplier(pair_data)
+    def scale_factor(self, pair_data: PairData, combined_balance: float, original_lot: float) -> float:
+        new_lot = self.compute_new_lot(pair_data, combined_balance)
+        if original_lot <= 0:
+            return 0.0
+        return new_lot / original_lot
 
-    def scale_volume(self, pair_data: PairData, balance: float, volume: float) -> float:
-        return volume * self.total_scale(pair_data, balance)
+    def scale_volume(self, pair_data: PairData, combined_balance: float, original_lot: float) -> float:
+        return original_lot * self.scale_factor(pair_data, combined_balance, original_lot)
 
 
 class Broker(Protocol):
@@ -392,18 +464,22 @@ class MarginCalculator:
     def __init__(self, broker: Broker):
         self.broker = broker
 
-    def calculate_used_margin(self, positions: Dict[str, Position]) -> float:
+    def calculate_used_margin(self, positions: Dict[str, List[Position]]) -> float:
         used_margin = 0.0
-        for pair, position in positions.items():
-            if position.lots <= 0 or not position.last_price:
+        for pair, pair_positions in positions.items():
+            lots = sum(max(0.0, p.lots) for p in pair_positions)
+            if lots <= 0:
+                continue
+            last_price = next((p.last_price for p in reversed(pair_positions) if p.last_price), None)
+            if not last_price:
                 continue
             mmr = self.broker.margin_requirement_percent(pair)
             if mmr <= 0:
                 continue
             used_margin += (
-                position.lots
+                lots
                 * self.broker.contract_size(pair)
-                * position.last_price
+                * last_price
                 * mmr
             ) / 100.0
         return used_margin
@@ -428,6 +504,7 @@ class PortfolioStatistics:
         final_balance: float,
         final_equity: float,
         equity_values: List[float],
+        floating_values: List[float],
         margin_level_values: List[float],
         max_used_margin: float,
         min_free_margin: Optional[float],
@@ -438,7 +515,18 @@ class PortfolioStatistics:
         pair_pnl: Dict[str, float],
     ) -> Dict[str, object]:
         total_return_pct = (final_balance / initial_balance - 1.0) * 100.0
-        abs_dd, pct_dd = _max_drawdown(equity_values)
+        if equity_values and floating_values and len(equity_values) == len(floating_values):
+            balance_values = [eq - flt for eq, flt in zip(equity_values, floating_values)]
+            dd_ratio = [
+                (flt / bal) if bal != 0 else 0.0
+                for flt, bal in zip(floating_values, balance_values)
+            ]
+            worst_idx = min(range(len(dd_ratio)), key=lambda i: dd_ratio[i])
+            abs_dd = floating_values[worst_idx]
+            pct_dd = dd_ratio[worst_idx]
+        else:
+            abs_dd = 0.0
+            pct_dd = 0.0
 
         span_days = max((end_time - start_time).total_seconds() / 86400.0, 0.0)
         years = span_days / 365.25
@@ -529,6 +617,10 @@ class PortfolioSimulator:
         if not any_deals:
             raise ValueError("No deal events loaded from any pair")
 
+        for pair_data in self.pairs_data:
+            if pair_data.config.risk_percent < 0:
+                raise ValueError(f"risk_percent must be >= 0 for {pair_data.config.name}")
+
     def _build_sorted_deal_events(self) -> List[DealEvent]:
         all_events: List[DealEvent] = []
         for pair_data in self.pairs_data:
@@ -556,9 +648,8 @@ class PortfolioSimulator:
 
         for event in all_events:
             pair_data = pairs_by_name[event.pair]
-            bscale = self.sizer.scale_balance(balance)
-            pair_mult = self.sizer.pair_multiplier(pair_data)
-            total_scale = bscale * pair_mult
+            new_lot = self.sizer.compute_new_lot(pair_data, balance)
+            total_scale = self.sizer.scale_factor(pair_data, balance, event.volume)
             scaled_pnl = event.net_profit * total_scale
 
             balance += scaled_pnl
@@ -570,12 +661,11 @@ class PortfolioSimulator:
                 "pair": event.pair,
                 "baseline_net_profit": round(event.net_profit, 6),
                 "baseline_volume": round(event.volume, 4),
-                "balance_scale": round(bscale, 6),
-                "pair_multiplier": round(pair_mult, 6),
+                "new_lot": round(new_lot, 4),
                 "total_scale": round(total_scale, 6),
                 "scaled_net_profit": round(scaled_pnl, 4),
                 "running_balance": round(balance, 4),
-                "scaled_volume": round(event.volume * total_scale, 4),
+                "scaled_volume": round(new_lot, 4),
             })
 
         return balance, balance_checkpoints, event_rows, pair_pnl
@@ -586,17 +676,18 @@ class PortfolioSimulator:
         timeline: List[datetime],
         balance_checkpoints: List[Tuple[datetime, float]],
         all_trade_events: List[TradeEvent],
-    ) -> Tuple[List[Dict[str, object]], List[float], List[float], float, Optional[float]]:
+    ) -> Tuple[List[Dict[str, object]], List[float], List[float], List[float], float, Optional[float]]:
         checkpoint_times = [ts for ts, _ in balance_checkpoints]
         trade_idx = 0
 
         positions = {
-            pair_data.config.name: Position(pair=pair_data.config.name)
+            pair_data.config.name: []
             for pair_data in self.pairs_data
         }
 
         curve_rows: List[Dict[str, object]] = []
         equity_values: List[float] = []
+        floating_values: List[float] = []
         margin_level_values: List[float] = []
         max_used_margin = 0.0
         min_free_margin: Optional[float] = None
@@ -613,30 +704,49 @@ class PortfolioSimulator:
                 trade_balance = balance_checkpoints[max(trade_bal_idx, 0)][1]
                 scaled_volume = self.sizer.scale_volume(trade_pair, trade_balance, trade.volume)
 
-                position = positions[trade.pair]
                 if trade.direction == "in":
-                    position.lots += scaled_volume
-                    position.baseline_lots += trade.volume
+                    positions[trade.pair].append(Position(
+                        pair=trade.pair,
+                        side=trade.side,
+                        lots=scaled_volume,
+                        entry_price=trade.price,
+                        last_price=trade.price if trade.price > 0 else None,
+                    ))
                 elif trade.direction == "out":
-                    position.lots = max(0.0, position.lots - scaled_volume)
-                    position.baseline_lots = max(0.0, position.baseline_lots - trade.volume)
+                    remaining = scaled_volume
+                    # FIFO close approximation using reconstructed scaled lots.
+                    pair_positions = positions[trade.pair]
+                    i = 0
+                    while remaining > 0 and i < len(pair_positions):
+                        open_pos = pair_positions[i]
+                        close_lots = min(open_pos.lots, remaining)
+                        open_pos.lots -= close_lots
+                        remaining -= close_lots
+                        if open_pos.lots <= 1e-12:
+                            pair_positions.pop(i)
+                            continue
+                        i += 1
 
                 if trade.price > 0:
-                    position.last_price = trade.price
+                    for open_pos in positions[trade.pair]:
+                        open_pos.last_price = trade.price
 
                 trade_idx += 1
 
             floating = 0.0
             for pair_data in self.pairs_data:
-                position = positions[pair_data.config.name]
-                if position.baseline_lots > 0:
-                    floating_scale = position.lots / position.baseline_lots
-                else:
-                    floating_scale = 0.0
-                floating += (
-                    pair_data.interpolate_floating(ts)
-                    * floating_scale
-                )
+                mkt_price = pair_data.market_price_at(ts)
+                if mkt_price is None:
+                    continue
+
+                for open_pos in positions[pair_data.config.name]:
+                    if open_pos.lots <= 0 or open_pos.entry_price <= 0:
+                        continue
+                    side = (open_pos.side or "").lower()
+                    if side.startswith("sell"):
+                        floating += (open_pos.entry_price - mkt_price) * open_pos.lots * self.margin_calculator.broker.contract_size(pair_data.config.name)
+                    else:
+                        floating += (mkt_price - open_pos.entry_price) * open_pos.lots * self.margin_calculator.broker.contract_size(pair_data.config.name)
 
             equity = current_balance + floating
             used_margin = self.margin_calculator.calculate_used_margin(positions)
@@ -644,6 +754,7 @@ class PortfolioSimulator:
             margin_level = self.margin_calculator.calculate_margin_level_percent(equity, used_margin)
 
             equity_values.append(equity)
+            floating_values.append(floating)
             if margin_level is not None:
                 margin_level_values.append(margin_level)
 
@@ -660,7 +771,7 @@ class PortfolioSimulator:
                 "margin_level_percent": round(margin_level, 4) if margin_level is not None else "",
             })
 
-        return curve_rows, equity_values, margin_level_values, max_used_margin, min_free_margin
+        return curve_rows, equity_values, floating_values, margin_level_values, max_used_margin, min_free_margin
 
     def run(self) -> Dict[str, object]:
         pairs_by_name = {pair_data.config.name: pair_data for pair_data in self.pairs_data}
@@ -670,7 +781,7 @@ class PortfolioSimulator:
 
         all_curve_times = set()
         for pair_data in self.pairs_data:
-            all_curve_times.update(pair_data.curve_times)
+            all_curve_times.update(pair_data.market_times)
 
         start_time = min(
             all_events[0].time,
@@ -683,11 +794,11 @@ class PortfolioSimulator:
             start_time=start_time,
         )
 
-        timeline = sorted(all_curve_times.union({event.time for event in all_events}))
+        timeline = sorted(all_curve_times.union({event.time for event in all_events}).union({trade.time for trade in all_trade_events}))
         if not timeline:
             timeline = [start_time, balance_checkpoints[-1][0]]
 
-        curve_rows, equity_values, margin_levels, max_used_margin, min_free_margin = self.reconstruct_curve(
+        curve_rows, equity_values, floating_values, margin_levels, max_used_margin, min_free_margin = self.reconstruct_curve(
             pairs_by_name=pairs_by_name,
             timeline=timeline,
             balance_checkpoints=balance_checkpoints,
@@ -702,6 +813,7 @@ class PortfolioSimulator:
             final_balance=final_balance,
             final_equity=final_equity,
             equity_values=equity_values,
+            floating_values=floating_values,
             margin_level_values=margin_levels,
             max_used_margin=max_used_margin,
             min_free_margin=min_free_margin,
@@ -754,6 +866,8 @@ def build_pairs_from_auto(
     pair_base_lot: Dict[str, Optional[float]],
 ) -> List[PairData]:
     discovered = discover_files(data_dir)
+    reference_dir = os.path.join(os.path.dirname(data_dir), "reference")
+    market_files = discover_reference_price_files(reference_dir) if os.path.isdir(reference_dir) else {}
     pairs_data: List[PairData] = []
 
     for pair, files in discovered.items():
@@ -764,10 +878,11 @@ def build_pairs_from_auto(
             continue
 
         logger.info(
-            "%s: xlsx=%s  csv=%s",
+            "%s: xlsx=%s  csv=%s  mkt=%s",
             pair,
             os.path.basename(xlsx),
             os.path.basename(csv_path) if csv_path else "none",
+            os.path.basename(market_files[pair]) if pair in market_files else "none",
         )
         pairs_data.append(load_pair(
             name=pair,
@@ -775,6 +890,7 @@ def build_pairs_from_auto(
             base_lot=pair_base_lot.get(pair),
             xlsx_path=xlsx,
             csv_path=csv_path,
+            market_csv_path=market_files.get(pair),
         ))
 
     return pairs_data
@@ -784,10 +900,11 @@ def build_pairs_from_config(config: PortfolioConfig) -> List[PairData]:
     pairs_data: List[PairData] = []
     for pair in config.pairs:
         logger.info(
-            "%s: xlsx=%s  csv=%s",
+            "%s: xlsx=%s  csv=%s  mkt=%s",
             pair.name,
             os.path.basename(pair.xlsx_file),
             os.path.basename(pair.curve_file) if pair.curve_file else "none",
+            os.path.basename(pair.market_file) if pair.market_file else "none",
         )
         pairs_data.append(load_pair(
             name=pair.name,
@@ -795,6 +912,7 @@ def build_pairs_from_config(config: PortfolioConfig) -> List[PairData]:
             base_lot=pair.base_lot,
             xlsx_path=pair.xlsx_file,
             csv_path=pair.curve_file,
+            market_csv_path=pair.market_file,
         ))
     return pairs_data
 

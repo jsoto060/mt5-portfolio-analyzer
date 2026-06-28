@@ -25,14 +25,16 @@ class SimulationTests(unittest.TestCase):
             config=PairConfig(name="EURUSD", risk_percent=1.0, base_lot=None),
             deals=[DealEvent(time=start + timedelta(minutes=5), pair="EURUSD", net_profit=100.0, volume=1.0)],
             trades=[
-                TradeEvent(time=start, pair="EURUSD", direction="in", volume=1.0, price=1.1),
-                TradeEvent(time=start + timedelta(minutes=5), pair="EURUSD", direction="out", volume=1.0, price=1.1),
+                TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1),
+                TradeEvent(time=start + timedelta(minutes=5), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1),
             ],
             curve=[
                 CurvePoint(time=start, balance=1000.0, equity=1000.0),
                 CurvePoint(time=start + timedelta(minutes=5), balance=1100.0, equity=1100.0),
             ],
             baseline_volume_median=1.0,
+            market_times=[start, start + timedelta(minutes=5)],
+            market_close=[1.1, 1.1],
         )
 
     def test_pairdata_interpolation_uses_cached_arrays(self):
@@ -71,11 +73,11 @@ class SimulationTests(unittest.TestCase):
 
         # Pair A: one open position; standalone curve has constant floating -100 while open.
         pair_a = PairData(
-            config=PairConfig(name="EURUSD", risk_percent=1.0, base_lot=None),
+            config=PairConfig(name="EURUSD", risk_percent=100.0, base_lot=None),
             deals=[DealEvent(time=start + timedelta(minutes=15), pair="EURUSD", net_profit=-100.0, volume=1.0)],
             trades=[
-                TradeEvent(time=start, pair="EURUSD", direction="in", volume=1.0, price=1.1),
-                TradeEvent(time=start + timedelta(minutes=15), pair="EURUSD", direction="out", volume=1.0, price=1.1),
+                TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1),
+                TradeEvent(time=start + timedelta(minutes=15), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1),
             ],
             curve=[
                 CurvePoint(time=start, balance=1000.0, equity=900.0),
@@ -83,15 +85,17 @@ class SimulationTests(unittest.TestCase):
                 CurvePoint(time=start + timedelta(minutes=15), balance=900.0, equity=900.0),
             ],
             baseline_volume_median=1.0,
+            market_times=[start, start + timedelta(minutes=10), start + timedelta(minutes=15)],
+            market_close=[1.1, 1.0990, 1.1],
         )
 
         # Pair B: closes a profitable trade while Pair A remains open, raising portfolio balance.
         pair_b = PairData(
-            config=PairConfig(name="GBPUSD", risk_percent=1.0, base_lot=None),
+            config=PairConfig(name="GBPUSD", risk_percent=100.0, base_lot=None),
             deals=[DealEvent(time=start + timedelta(minutes=5), pair="GBPUSD", net_profit=500.0, volume=1.0)],
             trades=[
-                TradeEvent(time=start + timedelta(minutes=1), pair="GBPUSD", direction="in", volume=1.0, price=1.2),
-                TradeEvent(time=start + timedelta(minutes=5), pair="GBPUSD", direction="out", volume=1.0, price=1.2),
+                TradeEvent(time=start + timedelta(minutes=1), pair="GBPUSD", direction="in", side="buy", volume=1.0, price=1.2),
+                TradeEvent(time=start + timedelta(minutes=5), pair="GBPUSD", direction="out", side="buy", volume=1.0, price=1.2),
             ],
             curve=[
                 CurvePoint(time=start, balance=1000.0, equity=1000.0),
@@ -99,6 +103,8 @@ class SimulationTests(unittest.TestCase):
                 CurvePoint(time=start + timedelta(minutes=15), balance=1500.0, equity=1500.0),
             ],
             baseline_volume_median=1.0,
+            market_times=[start, start + timedelta(minutes=10), start + timedelta(minutes=15)],
+            market_close=[1.2, 1.2, 1.2],
         )
 
         sim = PortfolioSimulator(
@@ -112,7 +118,8 @@ class SimulationTests(unittest.TestCase):
         # At t+10m, Pair A is still open and baseline floating remains -100.
         # Correct behavior: floating should stay around -100 (entry scale frozen at 1x).
         row_10m = next(r for r in result["curve_rows"] if r["time"] == "2026.01.01 00:10")
-        self.assertAlmostEqual(float(row_10m["floating_pnl"]), -100.0, places=6)
+        # Price moved from 1.1000 to 1.0990 on a 1-lot long => about -100 USD floating.
+        self.assertAlmostEqual(float(row_10m["floating_pnl"]), -100.0, places=4)
 
 
 class ReaderDiscoveryTests(unittest.TestCase):

@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 class RawDeal:
     time: datetime
     direction: str          # 'in' or 'out'
+    side: str               # 'buy' or 'sell' when available
     volume: float
     price: float
     commission: float
@@ -159,6 +160,7 @@ def load_xlsx_deals(path: str, include_open: bool = False) -> Tuple[List[RawDeal
         deals.append(RawDeal(
             time=ts,
             direction=direction,
+            side=str(row[col["Type"]] or "").strip().lower() if "Type" in col else "",
             volume=_safe_float(row[col["Volume"]], 0.0),
             price=_safe_float(row[col["Price"]], 0.0),
             commission=_safe_float(row[col["Commission"]], 0.0),
