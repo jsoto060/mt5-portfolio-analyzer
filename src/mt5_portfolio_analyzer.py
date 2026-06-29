@@ -1131,6 +1131,19 @@ def main() -> None:
         max_scale=scaling.max_scale,
     )
 
+    # Import modular reporting stack lazily to avoid circular imports.
+    import pandas as pd
+    import metrics as metrics_module
+    import reports as reports_module
+
+    metric_bundle = metrics_module.build_metric_bundle(
+        summary=result["summary"],
+        curve_rows=result["curve_rows"],
+        event_rows=result["event_rows"],
+    )
+    summary_table = reports_module.create_summary_table(metric_bundle)
+    replay_table = pd.DataFrame(result["event_rows"])
+
     events_path = os.path.join(output_dir, "combined_events.csv")
     curve_path = os.path.join(output_dir, "combined_curve.csv")
     summary_path = os.path.join(output_dir, "summary.json")
@@ -1140,7 +1153,18 @@ def main() -> None:
     with open(summary_path, "w", encoding="utf-8") as fh:
         json.dump(result["summary"], fh, indent=2)
 
-    summary = result["summary"]
+    # New modular exports used by thin notebooks and facade APIs.
+    reports_module.export_summary(
+        output_dir=output_dir,
+        metrics_bundle=metric_bundle,
+        summary_df=summary_table,
+        replay_df=replay_table,
+    )
+    # Preserve legacy summary.json payload for backward compatibility.
+    with open(summary_path, "w", encoding="utf-8") as fh:
+        json.dump(result["summary"], fh, indent=2)
+
+    summary = metric_bundle
     logger.info("--- Results ---")
     logger.info("Period:          %s  to  %s", summary["period_start"], summary["period_end"])
     logger.info("Deals replayed:  %s", summary["total_deals"])
