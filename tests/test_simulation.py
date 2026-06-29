@@ -3,13 +3,15 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.abspath("src"))
 
 from mt5_portfolio_analyzer import (  # noqa: E402
+    BaselineConfig,
     CurvePoint,
     DealEvent,
-    PairConfig,
+    infer_baseline_config,
     PairData,
     PortfolioSimulator,
     ScalingConfig,
@@ -22,7 +24,17 @@ class SimulationTests(unittest.TestCase):
     def _single_pair(self):
         start = datetime(2026, 1, 1, 0, 0, 0)
         return PairData(
-            config=PairConfig(name="EURUSD", risk_percent=1.0, base_lot=None),
+            name="EURUSD",
+            baseline_config=BaselineConfig(
+                risk_percent=1.0,
+                take_profit=None,
+                grid_size=None,
+                max_trades=1,
+                initial_balance=1000.0,
+                first_lot=1.0,
+                median_lot=1.0,
+                trade_count=1,
+            ),
             deals=[DealEvent(time=start + timedelta(minutes=5), pair="EURUSD", net_profit=100.0, volume=1.0)],
             trades=[
                 TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1),
@@ -73,7 +85,17 @@ class SimulationTests(unittest.TestCase):
 
         # Pair A: one open position; standalone curve has constant floating -100 while open.
         pair_a = PairData(
-            config=PairConfig(name="EURUSD", risk_percent=100.0, base_lot=None),
+            name="EURUSD",
+            baseline_config=BaselineConfig(
+                risk_percent=100.0,
+                take_profit=None,
+                grid_size=None,
+                max_trades=1,
+                initial_balance=1000.0,
+                first_lot=1.0,
+                median_lot=1.0,
+                trade_count=1,
+            ),
             deals=[DealEvent(time=start + timedelta(minutes=15), pair="EURUSD", net_profit=-100.0, volume=1.0)],
             trades=[
                 TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1),
@@ -91,7 +113,17 @@ class SimulationTests(unittest.TestCase):
 
         # Pair B: closes a profitable trade while Pair A remains open, raising portfolio balance.
         pair_b = PairData(
-            config=PairConfig(name="GBPUSD", risk_percent=100.0, base_lot=None),
+            name="GBPUSD",
+            baseline_config=BaselineConfig(
+                risk_percent=100.0,
+                take_profit=None,
+                grid_size=None,
+                max_trades=1,
+                initial_balance=1000.0,
+                first_lot=1.0,
+                median_lot=1.0,
+                trade_count=1,
+            ),
             deals=[DealEvent(time=start + timedelta(minutes=5), pair="GBPUSD", net_profit=500.0, volume=1.0)],
             trades=[
                 TradeEvent(time=start + timedelta(minutes=1), pair="GBPUSD", direction="in", side="buy", volume=1.0, price=1.2),
@@ -129,6 +161,38 @@ class ReaderDiscoveryTests(unittest.TestCase):
             open(os.path.join(tmp, "testergraph.report.2_eurusd.csv"), "w", encoding="utf-8").close()
             with self.assertRaises(ValueError):
                 discover_files(tmp)
+
+
+class BaselineInferenceTests(unittest.TestCase):
+    def test_infers_risk_tp_max_trades_and_lot_stats(self):
+        start = datetime(2026, 1, 1, 0, 0, 0)
+        raw_deals = [
+            SimpleNamespace(time=start, direction="in", side="buy", volume=0.10, price=1.1000, profit=0.0, commission=0.0, swap=0.0, balance=0.0),
+            SimpleNamespace(time=start + timedelta(minutes=1), direction="in", side="buy", volume=0.10, price=1.0950, profit=0.0, commission=0.0, swap=0.0, balance=0.0),
+            SimpleNamespace(time=start + timedelta(minutes=5), direction="out", side="sell", volume=0.10, price=1.1015, profit=15.0, commission=0.0, swap=0.0, balance=10015.0),
+            SimpleNamespace(time=start + timedelta(minutes=6), direction="out", side="sell", volume=0.10, price=1.1015, profit=15.0, commission=0.0, swap=0.0, balance=10030.0),
+        ]
+        baseline, risk_std = infer_baseline_config(raw_deals, initial_balance=10000.0, pair="EURUSD")
+
+        self.assertAlmostEqual(baseline.risk_percent, 1.0, places=6)
+        self.assertEqual(baseline.max_trades, 2)
+        self.assertEqual(baseline.first_lot, 0.10)
+        self.assertEqual(baseline.median_lot, 0.10)
+        self.assertEqual(baseline.trade_count, 2)
+        self.assertEqual(baseline.grid_size, 50)
+        self.assertTrue(baseline.take_profit is not None and baseline.take_profit > 0)
+        self.assertAlmostEqual(risk_std or 0.0, 0.0, places=8)
+
+    def test_infers_risk_std_for_variable_position_sizing(self):
+        start = datetime(2026, 1, 1, 0, 0, 0)
+        raw_deals = [
+            SimpleNamespace(time=start, direction="in", side="buy", volume=0.10, price=1.1000, profit=0.0, commission=0.0, swap=0.0, balance=0.0),
+            SimpleNamespace(time=start + timedelta(minutes=1), direction="out", side="sell", volume=0.10, price=1.1010, profit=10.0, commission=0.0, swap=0.0, balance=10010.0),
+            SimpleNamespace(time=start + timedelta(minutes=2), direction="in", side="buy", volume=0.30, price=1.1000, profit=0.0, commission=0.0, swap=0.0, balance=0.0),
+            SimpleNamespace(time=start + timedelta(minutes=3), direction="out", side="sell", volume=0.30, price=1.1010, profit=30.0, commission=0.0, swap=0.0, balance=10040.0),
+        ]
+        _, risk_std = infer_baseline_config(raw_deals, initial_balance=10000.0, pair="EURUSD")
+        self.assertTrue(risk_std is not None and risk_std > 0.05)
 
 
 if __name__ == "__main__":

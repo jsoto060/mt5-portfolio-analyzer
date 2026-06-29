@@ -69,24 +69,44 @@ class CurvePoint:
     equity: float
 
 
-@dataclass
-class PairConfig:
-    name: str
+@dataclass(frozen=True)
+class BaselineConfig:
     risk_percent: float
-    base_lot: Optional[float]
+    take_profit: Optional[int]
+    grid_size: Optional[int]
+    max_trades: int
+    initial_balance: float
+    first_lot: Optional[float]
+    median_lot: Optional[float]
+    trade_count: int
+
+
+@dataclass(frozen=True)
+class ScenarioConfig:
+    risk_percent: Optional[float] = None
+    take_profit: Optional[int] = None
+    grid_size: Optional[int] = None
+    max_trades: Optional[int] = None
 
 
 @dataclass
 class PairData:
-    config: PairConfig
+    name: str
+    baseline_config: BaselineConfig
     deals: List[DealEvent]
     trades: List[TradeEvent]
     curve: List[CurvePoint]
     baseline_volume_median: Optional[float]
+    scenario_config: Optional[ScenarioConfig] = None
     curve_times: List[datetime] = field(default_factory=list)
     curve_floating: List[float] = field(default_factory=list)
     market_times: List[datetime] = field(default_factory=list)
     market_close: List[float] = field(default_factory=list)
+
+    def effective_risk_percent(self) -> float:
+        if self.scenario_config and self.scenario_config.risk_percent is not None:
+            return float(self.scenario_config.risk_percent)
+        return float(self.baseline_config.risk_percent)
 
     def __post_init__(self) -> None:
         if self.curve and not self.curve_times:
@@ -148,8 +168,6 @@ class ScalingConfig:
 @dataclass
 class PairInputConfig:
     name: str
-    risk_percent: float
-    base_lot: Optional[float]
     xlsx_file: str
     curve_file: Optional[str]
     market_file: Optional[str]
@@ -170,6 +188,102 @@ class PortfolioConfig:
 def _median_volume(deals: List[DealEvent]) -> Optional[float]:
     vols = [d.volume for d in deals if d.volume > 0]
     return median(vols) if vols else None
+
+
+def _safe_int(value: Optional[float]) -> Optional[int]:
+    if value is None:
+        return None
+    return int(round(float(value)))
+
+
+def infer_baseline_config(raw_deals: List[object], initial_balance: float, pair: str) -> Tuple[BaselineConfig, Optional[float]]:
+    """Infer immutable baseline strategy settings from MT5 deal flow."""
+    deals_sorted = sorted(raw_deals, key=lambda d: (d.time, 0 if d.direction == "out" else 1))
+    in_deals = [d for d in deals_sorted if d.direction == "in"]
+    out_deals = [d for d in deals_sorted if d.direction == "out"]
+
+    first_lot = next((float(d.volume) for d in in_deals if float(d.volume) > 0), None)
+    median_lot = median([float(d.volume) for d in in_deals if float(d.volume) > 0]) if in_deals else None
+
+    balance_before = float(initial_balance) if initial_balance and initial_balance > 0 else None
+    risk_samples: List[float] = []
+    tp_samples_pips: List[float] = []
+    grid_samples_pips: List[float] = []
+
+    open_buys: List[Dict[str, float]] = []
+    open_sells: List[Dict[str, float]] = []
+    open_total = 0
+    max_open_total = 0
+
+    pip_factor = 100 if pair.upper().endswith("JPY") else 10000
+    previous_in_price_by_side: Dict[str, float] = {}
+
+    def weighted_avg_price(legs: List[Dict[str, float]]) -> Optional[float]:
+        total_lot = sum(x["volume"] for x in legs if x["volume"] > 0)
+        if total_lot <= 0:
+            return None
+        return sum(x["price"] * x["volume"] for x in legs if x["volume"] > 0) / total_lot
+
+    for deal in deals_sorted:
+        if deal.direction == "in":
+            side = (deal.side or "").lower()
+            lot = float(deal.volume)
+            price = float(deal.price)
+
+            if side == "buy":
+                open_buys.append({"volume": lot, "price": price})
+            elif side == "sell":
+                open_sells.append({"volume": lot, "price": price})
+
+            if side in previous_in_price_by_side and price > 0 and previous_in_price_by_side[side] > 0:
+                grid_samples_pips.append(abs(price - previous_in_price_by_side[side]) * pip_factor)
+            if side:
+                previous_in_price_by_side[side] = price
+
+            open_total += 1
+            max_open_total = max(max_open_total, open_total)
+
+            if balance_before and balance_before > 0 and lot > 0:
+                risk_samples.append((lot * 100000.0) / balance_before)
+
+        elif deal.direction == "out":
+            side = (deal.side or "").lower()
+            basket = None
+            if side == "sell":
+                basket = open_buys
+            elif side == "buy":
+                basket = open_sells
+            elif open_buys or open_sells:
+                basket = open_buys if len(open_buys) >= len(open_sells) else open_sells
+
+            if basket:
+                be_price = weighted_avg_price(basket)
+                if be_price is not None and float(deal.price) > 0:
+                    tp_samples_pips.append(abs(float(deal.price) - be_price) * pip_factor)
+                basket.pop(0)
+
+            open_total = max(0, open_total - 1)
+
+            if deal.balance and deal.balance > 0:
+                balance_before = float(deal.balance)
+            elif balance_before is not None:
+                balance_before += float(deal.profit) + float(deal.commission) + float(deal.swap)
+
+    # Baseline risk is represented at one-decimal precision in legacy backtest setup.
+    risk_percent = round(float(median(risk_samples)), 1) if risk_samples else 0.0
+    risk_std = float((sum((x - risk_percent) ** 2 for x in risk_samples) / len(risk_samples)) ** 0.5) if risk_samples else None
+
+    baseline = BaselineConfig(
+        risk_percent=risk_percent,
+        take_profit=_safe_int(median(tp_samples_pips)) if tp_samples_pips else None,
+        grid_size=_safe_int(median(grid_samples_pips)) if grid_samples_pips else None,
+        max_trades=max(1, int(max_open_total)),
+        initial_balance=float(initial_balance or 0.0),
+        first_lot=first_lot,
+        median_lot=median_lot,
+        trade_count=len(out_deals),
+    )
+    return baseline, risk_std
 
 
 def _max_drawdown(values: List[float]) -> Tuple[float, float]:
@@ -322,8 +436,6 @@ def _parse_portfolio_config(config_obj: Dict[str, object], config_dir: str) -> P
 
         pairs.append(PairInputConfig(
             name=name,
-            risk_percent=float(raw_pair.get("risk_percent", 0.0)),
-            base_lot=float(raw_pair["base_lot"]) if raw_pair.get("base_lot") is not None else None,
             xlsx_file=xlsx,
             curve_file=curve,
             market_file=_resolve_abs_path(config_dir, raw_pair.get("market_file")),
@@ -343,13 +455,20 @@ def _parse_portfolio_config(config_obj: Dict[str, object], config_dir: str) -> P
 
 def load_pair(
     name: str,
-    risk_percent: float,
-    base_lot: Optional[float],
     xlsx_path: str,
     csv_path: Optional[str] = None,
     market_csv_path: Optional[str] = None,
+    scenario_config: Optional[ScenarioConfig] = None,
 ) -> PairData:
-    raw_deals, _initial = load_xlsx_deals(xlsx_path, include_open=True)
+    raw_deals, inferred_initial_balance = load_xlsx_deals(xlsx_path, include_open=True)
+    baseline_config, risk_std = infer_baseline_config(raw_deals, inferred_initial_balance, name)
+    if risk_std is not None and risk_std > 0.05:
+        logger.warning(
+            "%s inferred risk std deviation is %.4f%% (> 0.05%%). EA may not use fixed-risk position sizing.",
+            name,
+            risk_std,
+        )
+
     trades = [
         TradeEvent(
             time=d.time,
@@ -384,11 +503,13 @@ def load_pair(
         market_times, market_close = _load_m1_market_csv(market_csv_path)
 
     return PairData(
-        config=PairConfig(name=name, risk_percent=risk_percent, base_lot=base_lot),
+        name=name,
+        baseline_config=baseline_config,
         deals=deals,
         trades=trades,
         curve=curve,
         baseline_volume_median=_median_volume(deals),
+        scenario_config=scenario_config,
         market_times=market_times,
         market_close=market_close,
     )
@@ -412,7 +533,7 @@ class PositionSizer:
     def compute_new_lot(pair_data: PairData, combined_balance: float) -> float:
         """Lot sizing rule requested by user: round(balance * risk% / 100000, 2)."""
         safe_balance = max(0.0, combined_balance)
-        risk_percent = max(0.0, float(pair_data.config.risk_percent or 0.0))
+        risk_percent = max(0.0, float(pair_data.effective_risk_percent() or 0.0))
         return round(safe_balance * risk_percent / 100000.0, 2)
 
     def scale_factor(self, pair_data: PairData, combined_balance: float, original_lot: float) -> float:
@@ -547,15 +668,22 @@ class PortfolioStatistics:
             "period_start": start_time.strftime("%Y.%m.%d %H:%M:%S"),
             "period_end": end_time.strftime("%Y.%m.%d %H:%M:%S"),
             "pairs": {
-                pair_data.config.name: {
-                    "risk_percent": pair_data.config.risk_percent,
-                    "configured_base_lot": pair_data.config.base_lot,
+                pair_data.name: {
+                    "risk_percent": pair_data.effective_risk_percent(),
+                    "baseline_risk_percent": pair_data.baseline_config.risk_percent,
+                    "baseline_take_profit": pair_data.baseline_config.take_profit,
+                    "baseline_grid_size": pair_data.baseline_config.grid_size,
+                    "baseline_max_trades": pair_data.baseline_config.max_trades,
+                    "baseline_initial_balance": pair_data.baseline_config.initial_balance,
+                    "baseline_first_lot": pair_data.baseline_config.first_lot,
+                    "baseline_median_lot": pair_data.baseline_config.median_lot,
+                    "baseline_trade_count": pair_data.baseline_config.trade_count,
                     "baseline_volume_median": (
                         round(pair_data.baseline_volume_median, 4)
                         if pair_data.baseline_volume_median is not None
                         else None
                     ),
-                    "scaled_pnl_contribution": round(pair_pnl[pair_data.config.name], 4),
+                    "scaled_pnl_contribution": round(pair_pnl[pair_data.name], 4),
                     "deals_count": len(pair_data.deals),
                 }
                 for pair_data in pairs_data
@@ -601,6 +729,24 @@ class PortfolioSimulator:
         self.statistics = PortfolioStatistics()
 
         self._validate_inputs()
+        self._log_detected_baseline_configuration()
+
+    def _log_detected_baseline_configuration(self) -> None:
+        logger.info("Detected Baseline Configuration")
+        logger.info("Pair      Risk    TP    Grid   MaxTrades   Trades")
+        for pair_data in sorted(self.pairs_data, key=lambda p: p.name):
+            baseline = pair_data.baseline_config
+            tp = baseline.take_profit if baseline.take_profit is not None else "-"
+            grid = baseline.grid_size if baseline.grid_size is not None else "-"
+            logger.info(
+                "%-8s %5.2f %5s %6s %10d %8d",
+                pair_data.name,
+                baseline.risk_percent,
+                tp,
+                grid,
+                baseline.max_trades,
+                baseline.trade_count,
+            )
 
     def _validate_inputs(self) -> None:
         if not self.pairs_data:
@@ -608,7 +754,7 @@ class PortfolioSimulator:
 
         seen = set()
         for pair_data in self.pairs_data:
-            name = pair_data.config.name
+            name = pair_data.name
             if name in seen:
                 raise ValueError(f"Duplicate pair name in pairs_data: {name}")
             seen.add(name)
@@ -618,8 +764,8 @@ class PortfolioSimulator:
             raise ValueError("No deal events loaded from any pair")
 
         for pair_data in self.pairs_data:
-            if pair_data.config.risk_percent < 0:
-                raise ValueError(f"risk_percent must be >= 0 for {pair_data.config.name}")
+            if pair_data.effective_risk_percent() < 0:
+                raise ValueError(f"risk_percent must be >= 0 for {pair_data.name}")
 
     def _build_sorted_deal_events(self) -> List[DealEvent]:
         all_events: List[DealEvent] = []
@@ -643,7 +789,7 @@ class PortfolioSimulator:
     ) -> Tuple[float, List[Tuple[datetime, float]], List[Dict[str, object]], Dict[str, float]]:
         balance = self.initial_balance
         balance_checkpoints: List[Tuple[datetime, float]] = [(start_time, balance)]
-        pair_pnl = {pair_data.config.name: 0.0 for pair_data in self.pairs_data}
+        pair_pnl = {pair_data.name: 0.0 for pair_data in self.pairs_data}
         event_rows: List[Dict[str, object]] = []
 
         for event in all_events:
@@ -681,7 +827,7 @@ class PortfolioSimulator:
         trade_idx = 0
 
         positions = {
-            pair_data.config.name: []
+            pair_data.name: []
             for pair_data in self.pairs_data
         }
 
@@ -739,14 +885,14 @@ class PortfolioSimulator:
                 if mkt_price is None:
                     continue
 
-                for open_pos in positions[pair_data.config.name]:
+                for open_pos in positions[pair_data.name]:
                     if open_pos.lots <= 0 or open_pos.entry_price <= 0:
                         continue
                     side = (open_pos.side or "").lower()
                     if side.startswith("sell"):
-                        floating += (open_pos.entry_price - mkt_price) * open_pos.lots * self.margin_calculator.broker.contract_size(pair_data.config.name)
+                        floating += (open_pos.entry_price - mkt_price) * open_pos.lots * self.margin_calculator.broker.contract_size(pair_data.name)
                     else:
-                        floating += (mkt_price - open_pos.entry_price) * open_pos.lots * self.margin_calculator.broker.contract_size(pair_data.config.name)
+                        floating += (mkt_price - open_pos.entry_price) * open_pos.lots * self.margin_calculator.broker.contract_size(pair_data.name)
 
             equity = current_balance + floating
             used_margin = self.margin_calculator.calculate_used_margin(positions)
@@ -774,7 +920,7 @@ class PortfolioSimulator:
         return curve_rows, equity_values, floating_values, margin_level_values, max_used_margin, min_free_margin
 
     def run(self) -> Dict[str, object]:
-        pairs_by_name = {pair_data.config.name: pair_data for pair_data in self.pairs_data}
+        pairs_by_name = {pair_data.name: pair_data for pair_data in self.pairs_data}
 
         all_events = self._build_sorted_deal_events()
         all_trade_events = self._build_sorted_trade_events()
@@ -851,19 +997,8 @@ def run_simulation(
     return simulator.run()
 
 
-# ---------------------------------------------------------------------------
-# Default per-pair settings (used in --auto mode)
-# ---------------------------------------------------------------------------
-
-
-_PAIR_RISK = {"EURUSD": 3.3, "EURGBP": 1.2, "GBPUSD": 2.0, "USDCHF": 1.5}
-_PAIR_BASE_LOT = {"EURUSD": None, "EURGBP": None, "GBPUSD": None, "USDCHF": None}
-
-
 def build_pairs_from_auto(
     data_dir: str,
-    pair_risk: Dict[str, float],
-    pair_base_lot: Dict[str, Optional[float]],
 ) -> List[PairData]:
     discovered = discover_files(data_dir)
     reference_dir = os.path.join(os.path.dirname(data_dir), "reference")
@@ -886,8 +1021,6 @@ def build_pairs_from_auto(
         )
         pairs_data.append(load_pair(
             name=pair,
-            risk_percent=pair_risk.get(pair, 0.0),
-            base_lot=pair_base_lot.get(pair),
             xlsx_path=xlsx,
             csv_path=csv_path,
             market_csv_path=market_files.get(pair),
@@ -908,8 +1041,6 @@ def build_pairs_from_config(config: PortfolioConfig) -> List[PairData]:
         )
         pairs_data.append(load_pair(
             name=pair.name,
-            risk_percent=pair.risk_percent,
-            base_lot=pair.base_lot,
             xlsx_path=pair.xlsx_file,
             csv_path=pair.curve_file,
             market_csv_path=pair.market_file,
@@ -951,7 +1082,7 @@ def main() -> None:
 
     if args.auto:
         data_dir = os.path.abspath(args.data_dir)
-        pairs_data = build_pairs_from_auto(data_dir, _PAIR_RISK, _PAIR_BASE_LOT)
+        pairs_data = build_pairs_from_auto(data_dir)
 
         if args.initial_balance is not None:
             initial_balance = args.initial_balance

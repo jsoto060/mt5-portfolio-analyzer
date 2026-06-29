@@ -13,7 +13,7 @@ The analyzer merges deals and balance/equity curves from each pair, simulates on
 
 	scale factor = (combined balance / initial balance) ^ scale exponent
 
-- Supports per-pair baseline lot normalization using a configured target base lot.
+- Infers per-pair baseline EA configuration directly from MT5 backtests (single source of truth).
 - Outputs combined balance/equity curve, event log, and performance summary.
 
 ## Repository Layout
@@ -64,20 +64,24 @@ Key fields:
 - `max_scale`: upper clamp for scaling factor.
 - `pairs`: list of pair definitions:
 	- `name`
-	- `risk_percent` (metadata/reporting)
-	- `base_lot` (target baseline lot for this pair)
-	- `deals_file` (required)
+	- `deals_file` / `xlsx_file` (required)
 	- `curve_file` (optional)
+	- `market_file` (optional)
 
-Per-pair total scale applied to baseline PnL is:
+Per-pair lot sizing is inferred from MT5 history and replayed as:
 
-total scale = balance scale * pair base multiplier
+new_lot = round(combined_balance * inferred_risk_percent / 100000, 2)
 
-Where pair base multiplier is estimated from:
+The analyzer infers and stores (per pair):
 
-pair base multiplier = configured base lot / median baseline deal volume
-
-If volumes are missing in deals data, pair base multiplier defaults to 1.0.
+- risk percent
+- take profit (pips, when inferable)
+- grid size (pips, when inferable)
+- max concurrent trades
+- initial balance
+- first lot
+- median lot
+- trade count
 
 ## Usage
 
