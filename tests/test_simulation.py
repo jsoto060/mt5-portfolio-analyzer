@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath("src"))
 
@@ -11,6 +12,7 @@ from mt5_portfolio_analyzer import (  # noqa: E402
     BaselineConfig,
     CurvePoint,
     DealEvent,
+    load_pair,
     infer_baseline_config,
     PairData,
     PortfolioSimulator,
@@ -161,6 +163,54 @@ class ReaderDiscoveryTests(unittest.TestCase):
             open(os.path.join(tmp, "testergraph.report.2_eurusd.csv"), "w", encoding="utf-8").close()
             with self.assertRaises(ValueError):
                 discover_files(tmp)
+
+
+class PairLoadingTests(unittest.TestCase):
+    def test_load_pair_includes_non_zero_in_commission_events(self):
+        start = datetime(2026, 1, 1, 0, 0, 0)
+        raw_deals = [
+            SimpleNamespace(
+                time=start,
+                direction="in",
+                side="buy",
+                volume=1.0,
+                price=1.1000,
+                profit=0.0,
+                commission=-2.5,
+                swap=0.0,
+                balance=0.0,
+            ),
+            SimpleNamespace(
+                time=start + timedelta(minutes=5),
+                direction="out",
+                side="sell",
+                volume=1.0,
+                price=1.1010,
+                profit=10.0,
+                commission=-2.5,
+                swap=0.0,
+                balance=10007.5,
+            ),
+        ]
+        baseline = BaselineConfig(
+            risk_percent=1.0,
+            take_profit=None,
+            grid_size=None,
+            max_trades=1,
+            initial_balance=1000.0,
+            first_lot=1.0,
+            median_lot=1.0,
+            trade_count=1,
+        )
+
+        with patch("mt5_portfolio_analyzer.load_xlsx_deals", return_value=(raw_deals, 1000.0)):
+            with patch("mt5_portfolio_analyzer.infer_baseline_config", return_value=(baseline, None)):
+                pair = load_pair(name="EURUSD", xlsx_path="dummy.xlsx")
+
+        self.assertEqual(len(pair.deals), 2)
+        self.assertAlmostEqual(pair.deals[0].net_profit, -2.5, places=8)
+        self.assertAlmostEqual(pair.deals[1].net_profit, 7.5, places=8)
+        self.assertAlmostEqual(pair.baseline_volume_median or 0.0, 1.0, places=8)
 
 
 class BaselineInferenceTests(unittest.TestCase):

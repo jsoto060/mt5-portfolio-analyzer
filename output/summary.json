@@ -1,15 +1,15 @@
 {
   "initial_balance": 5000.0,
-  "final_balance": 196918.2851,
-  "final_equity": 197051.8751,
-  "total_return_percent": 3838.3657,
-  "max_drawdown_abs": -11176.22,
-  "max_drawdown_percent": -85.024,
-  "max_used_margin": 108846.9133,
-  "min_free_margin": -14479.399,
-  "min_margin_level_percent": 13.0816,
-  "cagr_percent": 192.5172,
-  "total_deals": 2461,
+  "final_balance": 142614.2052,
+  "final_equity": 142719.2952,
+  "total_return_percent": 2752.2841,
+  "max_drawdown_abs": -10346.49,
+  "max_drawdown_percent": -86.1515,
+  "max_used_margin": 80011.9848,
+  "min_free_margin": -12655.2775,
+  "min_margin_level_percent": 11.8736,
+  "cagr_percent": 166.1996,
+  "total_deals": 4922,
   "period_start": "2023.01.02 00:00:00",
   "period_end": "2026.06.04 23:59:58",
   "pairs": {
@@ -24,8 +24,8 @@
       "baseline_median_lot": 0.35,
       "baseline_trade_count": 336,
       "baseline_volume_median": 0.35,
-      "scaled_pnl_contribution": 78710.1609,
-      "deals_count": 336
+      "scaled_pnl_contribution": 59184.7363,
+      "deals_count": 672
     },
     "EURGBP": {
       "risk_percent": 1.2,
@@ -38,8 +38,8 @@
       "baseline_median_lot": 0.07,
       "baseline_trade_count": 601,
       "baseline_volume_median": 0.07,
-      "scaled_pnl_contribution": 26531.7252,
-      "deals_count": 601
+      "scaled_pnl_contribution": 17733.2954,
+      "deals_count": 1202
     },
     "GBPUSD": {
       "risk_percent": 2.0,
@@ -52,8 +52,8 @@
       "baseline_median_lot": 0.15,
       "baseline_trade_count": 446,
       "baseline_volume_median": 0.15,
-      "scaled_pnl_contribution": 41619.7143,
-      "deals_count": 446
+      "scaled_pnl_contribution": 29760.9361,
+      "deals_count": 892
     },
     "USDCHF": {
       "risk_percent": 1.5,
@@ -66,22 +66,22 @@
       "baseline_median_lot": 0.11,
       "baseline_trade_count": 1078,
       "baseline_volume_median": 0.11,
-      "scaled_pnl_contribution": 45056.6847,
-      "deals_count": 1078
+      "scaled_pnl_contribution": 30935.2373,
+      "deals_count": 2156
     }
   },
-  "profit": 191918.2851,
-  "average_monthly_growth_percent": 9.142033129878442,
-  "max_floating_drawdown_abs": -54194.79,
-  "max_floating_drawdown_percent": -34.62694055099283,
-  "peak_equity_drawdown_abs": 40998.85690000001,
-  "peak_equity_drawdown_percent": 84.11324927528464,
-  "minimum_margin_level_percent": 13.0816,
-  "minimum_free_margin": -14479.399,
-  "maximum_used_margin": 108846.9133,
-  "total_trades": 2461,
+  "profit": 137614.2052,
+  "average_monthly_growth_percent": 8.30942894956938,
+  "max_floating_drawdown_abs": -40420.63,
+  "max_floating_drawdown_percent": -34.76836750766304,
+  "peak_equity_drawdown_abs": 30843.098400000003,
+  "peak_equity_drawdown_percent": 85.28427181906426,
+  "minimum_margin_level_percent": 11.8736,
+  "minimum_free_margin": -12655.2775,
+  "maximum_used_margin": 80011.9848,
+  "total_trades": 4922,
   "winning_trades": 2216,
-  "win_rate_percent": 90.04469727752947,
-  "profit_factor": 2.575256215393086,
-  "recovery_factor": 3.5412681754094812
+  "win_rate_percent": 45.02234863876473,
+  "profit_factor": 2.24921166041305,
+  "recovery_factor": 3.4045536944871966
 }

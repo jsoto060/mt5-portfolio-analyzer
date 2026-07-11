@@ -480,7 +480,7 @@ def load_pair(
         )
         for d in raw_deals
     ]
-    deals = [
+    out_deals = [
         DealEvent(
             time=d.time,
             pair=name,
@@ -490,6 +490,20 @@ def load_pair(
         for d in raw_deals
         if d.direction == "out"
     ]
+    # MT5 broker reports may charge commission on both IN and OUT legs.
+    # Replay balance updates are driven by deal events, so keep OUT events and
+    # inject non-zero IN costs to avoid overstating reconstructed profitability.
+    in_cost_events = [
+        DealEvent(
+            time=d.time,
+            pair=name,
+            net_profit=d.profit + d.commission + d.swap,
+            volume=d.volume,
+        )
+        for d in raw_deals
+        if d.direction == "in" and abs(d.profit + d.commission + d.swap) > 0.0
+    ]
+    deals = sorted(out_deals + in_cost_events, key=lambda ev: ev.time)
 
     if csv_path:
         raw_curve = load_graph_csv(csv_path)
@@ -508,7 +522,7 @@ def load_pair(
         deals=deals,
         trades=trades,
         curve=curve,
-        baseline_volume_median=_median_volume(deals),
+        baseline_volume_median=_median_volume(out_deals),
         scenario_config=scenario_config,
         market_times=market_times,
         market_close=market_close,
