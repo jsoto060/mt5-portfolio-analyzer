@@ -1,4 +1,4 @@
-"""High-level facade for MT5 replay, scenario analysis, and folder comparison."""
+﻿"""High-level facade for MT5 replay, scenario analysis, and folder comparison."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import charts
 import comparison
 import metrics
 import reports
+from mt5_portfolio_analyzer import load_forex_com_margin_requirements
 from replay_engine import ReplayEngine, ReplayRun
 from scenario import apply_scenario_overrides
 
@@ -135,13 +136,7 @@ class ReplayAnalyzer:
 
 def default_analyzer_for_repo(repo_root: str) -> ReplayAnalyzer:
     """Create analyzer with default settings and optional margin requirements file."""
-    mmr_csv = os.path.join(repo_root, "data", "reference", "forex_com_margin_requirements.csv")
-    margin_requirements: Dict[str, float] = {}
-    if os.path.exists(mmr_csv):
-        df = pd.read_csv(mmr_csv)
-        for _, row in df.iterrows():
-            pair_key = "".join(ch for ch in str(row["currency_pair"]).upper() if ch.isalpha())
-            margin_requirements[pair_key] = float(row["mmr_percent"])
+    margin_requirements = load_forex_com_margin_requirements(os.path.join(repo_root, "data", "reference"))
 
     return ReplayAnalyzer(
         initial_balance=5000.0,
@@ -150,3 +145,4 @@ def default_analyzer_for_repo(repo_root: str) -> ReplayAnalyzer:
         max_scale=5.0,
         margin_requirements=margin_requirements,
     )
+

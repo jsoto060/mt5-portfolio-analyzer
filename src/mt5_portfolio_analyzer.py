@@ -1,4 +1,4 @@
-"""
+﻿"""
 MT5 Portfolio Analyzer
 ======================
 Reconstructs a combined portfolio from separate MT5 Strategy Tester backtests.
@@ -333,6 +333,59 @@ def _normalize_pair_key(pair_name: str) -> str:
     return "".join(ch for ch in str(pair_name).upper() if ch.isalpha())
 
 
+def load_forex_com_margin_requirements(reference_dir: str) -> Dict[str, float]:
+    """Load and normalize Forex.com maintenance margin requirements."""
+    json_path = os.path.join(reference_dir, "forex_com_margin_requirements.json")
+    csv_path = os.path.join(reference_dir, "forex_com_margin_requirements.csv")
+
+    source_path = None
+    if os.path.exists(json_path):
+        source_path = json_path
+        with open(json_path, encoding="utf-8") as fh:
+            raw_rows = json.load(fh)
+    elif os.path.exists(csv_path):
+        source_path = csv_path
+        with open(csv_path, encoding="utf-8", newline="") as fh:
+            raw_rows = list(csv.DictReader(fh))
+    else:
+        raise FileNotFoundError(
+            f"Could not load Forex.com margin requirements from {reference_dir}: missing JSON and CSV files"
+        )
+
+    if isinstance(raw_rows, dict):
+        items = raw_rows.items()
+    elif isinstance(raw_rows, list):
+        items = []
+        for row in raw_rows:
+            if not isinstance(row, dict):
+                raise ValueError(f"Invalid Forex.com margin requirements format in {source_path}")
+            items.append((row.get("currency_pair") or row.get("pair") or row.get("symbol"), row.get("mmr_percent") or row.get("margin_percent") or row.get("mmr")))
+    else:
+        raise ValueError(f"Invalid Forex.com margin requirements format in {source_path}")
+
+    normalized: Dict[str, float] = {}
+    for raw_pair, raw_percent in items:
+        pair_key = _normalize_pair_key(raw_pair)
+        if not pair_key:
+            raise ValueError(f"Invalid Forex.com margin requirements entry in {source_path}: {raw_pair!r}")
+        try:
+            mmr_percent = float(raw_percent)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid Forex.com margin requirement for {raw_pair!r} in {source_path}: {raw_percent!r}"
+            ) from exc
+        if mmr_percent <= 0:
+            raise ValueError(f"Forex.com margin requirement must be > 0 for {raw_pair!r} in {source_path}")
+        if pair_key in normalized and normalized[pair_key] != mmr_percent:
+            raise ValueError(f"Duplicate Forex.com margin requirement for {pair_key} in {source_path}")
+        normalized[pair_key] = mmr_percent
+
+    if not normalized:
+        raise ValueError(f"No Forex.com margin requirements loaded from {source_path}")
+
+    return normalized
+
+
 def _write_csv(path: str, rows: List[Dict[str, object]]) -> None:
     if not rows:
         open(path, "w", encoding="utf-8").close()
@@ -582,6 +635,8 @@ class ForexBroker:
             _normalize_pair_key(pair): float(percent)
             for pair, percent in (self.margin_requirements or {}).items()
         }
+        if not self._norm_mmr:
+            raise ValueError("Forex.com margin requirements are required and cannot be empty")
 
     def margin_requirement_percent(self, pair: str) -> float:
         return self._norm_mmr.get(_normalize_pair_key(pair), 0.0)
@@ -599,22 +654,24 @@ class MarginCalculator:
     def __init__(self, broker: Broker):
         self.broker = broker
 
-    def calculate_used_margin(self, positions: Dict[str, List[Position]]) -> float:
+    def calculate_used_margin(self, positions: Dict[str, List[Position]], current_prices: Dict[str, Optional[float]]) -> float:
         used_margin = 0.0
         for pair, pair_positions in positions.items():
             lots = sum(max(0.0, p.lots) for p in pair_positions)
             if lots <= 0:
                 continue
-            last_price = next((p.last_price for p in reversed(pair_positions) if p.last_price), None)
-            if not last_price:
+            market_price = current_prices.get(pair)
+            if not market_price or market_price <= 0:
+                market_price = next((p.last_price for p in reversed(pair_positions) if p.last_price), None)
+            if not market_price:
                 continue
             mmr = self.broker.margin_requirement_percent(pair)
             if mmr <= 0:
-                continue
+                raise ValueError(f"Missing Forex.com margin requirement for pair: {pair}")
             used_margin += (
                 lots
                 * self.broker.contract_size(pair)
-                * last_price
+                * market_price
                 * mmr
             ) / 100.0
         return used_margin
@@ -780,6 +837,8 @@ class PortfolioSimulator:
         for pair_data in self.pairs_data:
             if pair_data.effective_risk_percent() < 0:
                 raise ValueError(f"risk_percent must be >= 0 for {pair_data.name}")
+            if self.margin_calculator.broker.margin_requirement_percent(pair_data.name) <= 0:
+                raise ValueError(f"Missing Forex.com margin requirement for {pair_data.name}")
 
     def _build_sorted_deal_events(self) -> List[DealEvent]:
         all_events: List[DealEvent] = []
@@ -893,9 +952,14 @@ class PortfolioSimulator:
 
                 trade_idx += 1
 
+            current_prices = {
+                pair_data.name: pair_data.market_price_at(ts)
+                for pair_data in self.pairs_data
+            }
+
             floating = 0.0
             for pair_data in self.pairs_data:
-                mkt_price = pair_data.market_price_at(ts)
+                mkt_price = current_prices[pair_data.name]
                 if mkt_price is None:
                     continue
 
@@ -909,7 +973,7 @@ class PortfolioSimulator:
                         floating += (mkt_price - open_pos.entry_price) * open_pos.lots * self.margin_calculator.broker.contract_size(pair_data.name)
 
             equity = current_balance + floating
-            used_margin = self.margin_calculator.calculate_used_margin(positions)
+            used_margin = self.margin_calculator.calculate_used_margin(positions, current_prices)
             free_margin = self.margin_calculator.calculate_free_margin(equity, used_margin)
             margin_level = self.margin_calculator.calculate_margin_level_percent(equity, used_margin)
 
@@ -1097,6 +1161,7 @@ def main() -> None:
     if args.auto:
         data_dir = os.path.abspath(args.data_dir)
         pairs_data = build_pairs_from_auto(data_dir)
+        margin_requirements = load_forex_com_margin_requirements(os.path.join(os.path.dirname(data_dir), "reference"))
 
         if args.initial_balance is not None:
             initial_balance = args.initial_balance
@@ -1118,6 +1183,7 @@ def main() -> None:
         parsed_config = _parse_portfolio_config(cfg_obj, os.path.dirname(config_path))
 
         pairs_data = build_pairs_from_config(parsed_config)
+        margin_requirements = load_forex_com_margin_requirements(os.path.join(os.path.dirname(os.path.dirname(config_path)), "data", "reference"))
         initial_balance = args.initial_balance if args.initial_balance is not None else parsed_config.initial_balance
 
         scaling = ScalingConfig(
@@ -1143,6 +1209,7 @@ def main() -> None:
         scale_exponent=scaling.exponent,
         min_scale=scaling.min_scale,
         max_scale=scaling.max_scale,
+        margin_requirements=margin_requirements,
     )
 
     # Import modular reporting stack lazily to avoid circular imports.
@@ -1195,3 +1262,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

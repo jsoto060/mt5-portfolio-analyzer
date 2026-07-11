@@ -155,6 +155,59 @@ class SimulationTests(unittest.TestCase):
         # Price moved from 1.1000 to 1.0990 on a 1-lot long => about -100 USD floating.
         self.assertAlmostEqual(float(row_10m["floating_pnl"]), -100.0, places=4)
 
+    def test_margin_uses_market_price_and_closes_to_zero(self):
+        start = datetime(2026, 1, 1, 0, 0, 0)
+        pair = PairData(
+            name="EURUSD",
+            baseline_config=BaselineConfig(
+                risk_percent=100.0,
+                take_profit=None,
+                grid_size=None,
+                max_trades=1,
+                initial_balance=1000.0,
+                first_lot=1.0,
+                median_lot=1.0,
+                trade_count=1,
+            ),
+            deals=[DealEvent(time=start + timedelta(minutes=10), pair="EURUSD", net_profit=5000.0, volume=1.0)],
+            trades=[
+                TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.0),
+                TradeEvent(time=start + timedelta(minutes=10), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.05),
+            ],
+            curve=[],
+            baseline_volume_median=1.0,
+            market_times=[start, start + timedelta(minutes=5), start + timedelta(minutes=10)],
+            market_close=[1.0, 1.1, 1.05],
+        )
+
+        sim = PortfolioSimulator(
+            pairs_data=[pair],
+            initial_balance=1000.0,
+            scaling=ScalingConfig(1.0, 0.1, 5.0),
+            margin_requirements={"EURUSD": 2.0},
+        )
+        result = sim.run()
+
+        row_open = next(r for r in result["curve_rows"] if r["time"] == "2026.01.01 00:00")
+        row_mid = next(r for r in result["curve_rows"] if r["time"] == "2026.01.01 00:05")
+        row_close = next(r for r in result["curve_rows"] if r["time"] == "2026.01.01 00:10")
+
+        self.assertAlmostEqual(float(row_open["used_margin"]), 2000.0, places=4)
+        self.assertAlmostEqual(float(row_mid["used_margin"]), 2200.0, places=4)
+        self.assertEqual(float(row_close["used_margin"]), 0.0)
+        self.assertAlmostEqual(float(row_mid["free_margin"]), float(row_mid["equity"]) - 2200.0, places=4)
+        self.assertAlmostEqual(float(row_mid["margin_level_percent"]), float(row_mid["equity"]) / 2200.0 * 100.0, places=4)
+
+    def test_missing_margin_requirements_fail_fast(self):
+        pair = self._single_pair()
+        with self.assertRaises(ValueError):
+            PortfolioSimulator(
+                pairs_data=[pair],
+                initial_balance=1000.0,
+                scaling=ScalingConfig(1.0, 0.1, 5.0),
+                margin_requirements={},
+            )
+
 
 class ReaderDiscoveryTests(unittest.TestCase):
     def test_duplicate_file_match_raises(self):
