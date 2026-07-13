@@ -141,3 +141,147 @@ def plot_comparison(baseline_curve_rows, proposed_curve_rows):
         fig.add_trace(go.Scatter(x=p["time"], y=p["equity"], name="Proposed Equity"))
     fig.update_layout(title="Portfolio Comparison", template="plotly_white")
     return fig
+
+
+# ===========================================================================
+# Margin Analysis Charts
+# These functions accept a DataFrame from MarginAnalysis.curve_df().
+# Column names follow the MarginAnalysis convention:
+#   timestamp, margin_level, used_margin, free_margin, floating_pnl
+#   <PAIR>_used_margin, <PAIR>_floating_pnl
+#   <PAIR>_used_margin_contribution_pct
+# ===========================================================================
+
+
+def plot_margin_level(margin_curve_df: pd.DataFrame) -> go.Figure:
+    """Margin level over time with threshold reference lines.
+
+    Parameters
+    ----------
+    margin_curve_df:
+        DataFrame from ``MarginAnalysis.curve_df()`` or ``load_margin_curve()``.
+    """
+    df = margin_curve_df.copy()
+    if df.empty or "margin_level" not in df.columns:
+        return go.Figure()
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    margin = pd.to_numeric(df["margin_level"], errors="coerce")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["timestamp"], y=margin,
+        name="Margin Level %",
+        line=dict(color="royalblue", width=1.5),
+    ))
+
+    for threshold, color in [(300, "green"), (200, "orange"), (150, "red"), (100, "darkred")]:
+        fig.add_hline(
+            y=threshold, line_dash="dash", line_color=color,
+            annotation_text=f"{threshold}%", annotation_position="right",
+        )
+
+    fig.update_layout(
+        title="Margin Level Timeline",
+        xaxis_title="Time", yaxis_title="Margin Level %",
+        template="plotly_white", hovermode="x unified",
+    )
+    return fig
+
+
+def plot_used_margin_by_pair(margin_curve_df: pd.DataFrame) -> go.Figure:
+    """Stacked used margin by pair over time.
+
+    Parameters
+    ----------
+    margin_curve_df:
+        DataFrame from ``MarginAnalysis.curve_df()``.
+    """
+    df = margin_curve_df.copy()
+    if df.empty:
+        return go.Figure()
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    pair_cols = {col: col.replace("_used_margin", "")
+                 for col in df.columns if col.endswith("_used_margin")}
+
+    fig = go.Figure()
+    for col, pair in pair_cols.items():
+        fig.add_trace(go.Scatter(
+            x=df["timestamp"], y=pd.to_numeric(df[col], errors="coerce"),
+            name=pair, mode="lines", stackgroup="used_margin",
+            line=dict(color=PAIR_COLORS.get(pair)),
+        ))
+
+    fig.update_layout(
+        title="Used Margin by Pair (Stacked)",
+        xaxis_title="Time", yaxis_title="Used Margin (USD)",
+        template="plotly_white", hovermode="x unified",
+    )
+    return fig
+
+
+def plot_floating_pnl_by_pair(margin_curve_df: pd.DataFrame) -> go.Figure:
+    """Stacked floating PnL by pair over time.
+
+    Parameters
+    ----------
+    margin_curve_df:
+        DataFrame from ``MarginAnalysis.curve_df()``.
+    """
+    df = margin_curve_df.copy()
+    if df.empty:
+        return go.Figure()
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    pair_cols = {col: col.replace("_floating_pnl", "")
+                 for col in df.columns
+                 if col.endswith("_floating_pnl") and col != "floating_pnl"}
+
+    fig = go.Figure()
+    for col, pair in pair_cols.items():
+        fig.add_trace(go.Scatter(
+            x=df["timestamp"], y=pd.to_numeric(df[col], errors="coerce"),
+            name=pair, mode="lines", stackgroup="floating",
+            line=dict(color=PAIR_COLORS.get(pair)),
+        ))
+
+    fig.update_layout(
+        title="Floating PnL by Pair (Stacked)",
+        xaxis_title="Time", yaxis_title="Floating PnL (USD)",
+        template="plotly_white", hovermode="x unified",
+    )
+    return fig
+
+
+def plot_used_margin_contribution(margin_curve_df: pd.DataFrame) -> go.Figure:
+    """Used-margin contribution % per pair over time.
+
+    Parameters
+    ----------
+    margin_curve_df:
+        DataFrame from ``MarginAnalysis.curve_df()``.
+    """
+    df = margin_curve_df.copy()
+    if df.empty:
+        return go.Figure()
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    pair_cols = {col: col.replace("_used_margin_contribution_pct", "")
+                 for col in df.columns if col.endswith("_used_margin_contribution_pct")}
+
+    fig = go.Figure()
+    for col, pair in pair_cols.items():
+        fig.add_trace(go.Scatter(
+            x=df["timestamp"], y=pd.to_numeric(df[col], errors="coerce"),
+            name=pair, mode="lines",
+            line=dict(color=PAIR_COLORS.get(pair), width=2),
+        ))
+
+    fig.update_layout(
+        title="Used Margin Contribution % by Pair",
+        xaxis_title="Time", yaxis_title="Contribution %",
+        template="plotly_white", hovermode="x unified",
+    )
+    return fig
+

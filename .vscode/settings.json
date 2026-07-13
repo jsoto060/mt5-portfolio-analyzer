@@ -3,6 +3,7 @@
         "/^c:/Users/jsotoalv/source/repos/mt5-portfolio-analyzer/\\.venv/Scripts/python\\.exe -m unittest -q$/": {
             "approve": true,
             "matchCommandLine": true
-        }
+        },
+        "&": true
     }
 }

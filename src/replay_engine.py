@@ -12,6 +12,7 @@ from typing import Dict, List, Optional
 from mt5_portfolio_analyzer import (
     PairData,
     ScalingConfig,
+    TimelineSnapshot,
     build_pairs_from_auto,
     run_simulation,
 )

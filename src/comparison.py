@@ -49,9 +49,7 @@ def compare_results(baseline_result, proposed_result) -> Dict[str, pd.DataFrame]
         baseline_result.metrics,
         proposed_result.metrics,
         [
-            ("Max Floating Drawdown", "max_floating_drawdown_abs"),
             ("Max Floating Drawdown %", "max_floating_drawdown_percent"),
-            ("Peak-to-Trough Equity Drawdown", "peak_equity_drawdown_abs"),
             ("Peak-to-Trough Equity Drawdown %", "peak_equity_drawdown_percent"),
         ],
     )

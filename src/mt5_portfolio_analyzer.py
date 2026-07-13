@@ -170,6 +170,36 @@ class Position:
     last_price: Optional[float] = None
 
 
+@dataclass
+class PairPositionSnapshot:
+    """Immutable snapshot of a single pair's replay state at one timestamp.
+
+    Produced by the replay engine; contains only raw state, no analytics.
+    """
+    pair: str
+    open_positions: int
+    total_lots: float
+    floating_pnl: float
+    used_margin: float
+
+
+@dataclass
+class TimelineSnapshot:
+    """Immutable snapshot of full portfolio replay state at one timestamp.
+
+    Produced by the replay engine; consumed by downstream analysis modules.
+    Contains only raw replay state, no analytics or derived metrics.
+    """
+    timestamp: datetime
+    balance: float
+    equity: float
+    floating_pnl: float
+    used_margin: float
+    free_margin: float
+    margin_level: Optional[float]
+    pair_snapshots: Dict[str, PairPositionSnapshot]
+
+
 # ---------------------------------------------------------------------------
 # Configuration types
 # ---------------------------------------------------------------------------
@@ -954,6 +984,7 @@ class PortfolioSimulator:
         margin_level_values: List[float] = []
         max_used_margin = 0.0
         min_free_margin: Optional[float] = None
+        timeline_snapshots: List[TimelineSnapshot] = []
 
         for ts in timeline:
             bal_idx = bisect.bisect_right(checkpoint_times, ts) - 1
@@ -1039,7 +1070,54 @@ class PortfolioSimulator:
                 "margin_level_percent": round(margin_level, 4) if margin_level is not None else "",
             })
 
-        return curve_rows, equity_values, floating_values, margin_level_values, max_used_margin, min_free_margin
+            # Capture immutable per-pair state for downstream analysis.
+            # Uses the existing margin_calculator formula decomposed per pair.
+            # No analytics or derived metrics are computed here.
+            pair_snapshots: Dict[str, PairPositionSnapshot] = {}
+            for pair_data in self.pairs_data:
+                pair_name = pair_data.name
+                pair_pos_list = positions[pair_name]
+
+                open_count = len([p for p in pair_pos_list if p.lots > 0])
+                total_lots = sum(p.lots for p in pair_pos_list if p.lots > 0)
+
+                pair_floating = 0.0
+                mkt_price = current_prices.get(pair_name)
+                if mkt_price is not None:
+                    for open_pos in pair_pos_list:
+                        if open_pos.lots <= 0 or open_pos.entry_price <= 0:
+                            continue
+                        side = (open_pos.side or "").lower()
+                        contract_size = self.margin_calculator.broker.contract_size(pair_name)
+                        if side.startswith("sell"):
+                            pair_floating += (open_pos.entry_price - mkt_price) * open_pos.lots * contract_size
+                        else:
+                            pair_floating += (mkt_price - open_pos.entry_price) * open_pos.lots * contract_size
+
+                pair_used_margin = self.margin_calculator.calculate_used_margin(
+                    {pair_name: pair_pos_list}, current_prices
+                )
+
+                pair_snapshots[pair_name] = PairPositionSnapshot(
+                    pair=pair_name,
+                    open_positions=open_count,
+                    total_lots=round(total_lots, 4),
+                    floating_pnl=round(pair_floating, 4),
+                    used_margin=round(pair_used_margin, 4),
+                )
+
+            timeline_snapshots.append(TimelineSnapshot(
+                timestamp=ts,
+                balance=round(current_balance, 4),
+                equity=round(equity, 4),
+                floating_pnl=round(floating, 4),
+                used_margin=round(used_margin, 4),
+                free_margin=round(free_margin, 4),
+                margin_level=round(margin_level, 4) if margin_level is not None else None,
+                pair_snapshots=pair_snapshots,
+            ))
+
+        return curve_rows, timeline_snapshots, equity_values, floating_values, margin_level_values, max_used_margin, min_free_margin
 
     def run(self) -> Dict[str, object]:
         pairs_by_name = {pair_data.name: pair_data for pair_data in self.pairs_data}
@@ -1066,7 +1144,7 @@ class PortfolioSimulator:
         if not timeline:
             timeline = [start_time, balance_checkpoints[-1][0]]
 
-        curve_rows, equity_values, floating_values, margin_levels, max_used_margin, min_free_margin = self.reconstruct_curve(
+        curve_rows, timeline_snapshots, equity_values, floating_values, margin_levels, max_used_margin, min_free_margin = self.reconstruct_curve(
             pairs_by_name=pairs_by_name,
             timeline=timeline,
             balance_checkpoints=balance_checkpoints,
@@ -1095,6 +1173,7 @@ class PortfolioSimulator:
         return {
             "event_rows": event_rows,
             "curve_rows": curve_rows,
+            "timeline_snapshots": timeline_snapshots,
             "summary": summary,
         }
 

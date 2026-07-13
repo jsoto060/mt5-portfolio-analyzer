@@ -10,6 +10,7 @@ import pandas as pd
 
 import charts
 import comparison
+import margin_analysis
 import metrics
 import reports
 from mt5_portfolio_analyzer import load_forex_com_margin_requirements
@@ -55,6 +56,10 @@ class ReplayResult:
     def plot_pair_drawdown(self):
         return charts.plot_pair_drawdown(self.run.result["event_rows"])
 
+    def margin_analysis(self) -> "margin_analysis.MarginAnalysis":
+        """Return a MarginAnalysis instance bound to this replay's snapshots."""
+        return margin_analysis.MarginAnalysis(self.run.result["timeline_snapshots"])
+
     def export(self, output_dir: str) -> None:
         reports.export_summary(
             output_dir=output_dir,
@@ -62,6 +67,7 @@ class ReplayResult:
             summary_df=self.summary(),
             replay_df=self.replay_table(),
         )
+        self.margin_analysis().export_all(output_dir)
 
 
 class ReplayAnalyzer:
