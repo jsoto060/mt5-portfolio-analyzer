@@ -101,6 +101,25 @@ The analyzer writes three files to `output-dir`:
 - `combined_curve.csv`: combined time series with balance, floating PnL, equity.
 - `summary.json`: final metrics and per-pair contribution.
 
+## Deterministic Replay Event Ordering
+
+Replay ordering is explicit and does not depend on filesystem discovery order.
+
+Implementation points:
+
+- Deal/trade events are created in `load_pair` in `src/mt5_portfolio_analyzer.py`.
+- Per-pair events are merged in `PortfolioSimulator._build_sorted_deal_events` and `PortfolioSimulator._build_sorted_trade_events` in `src/mt5_portfolio_analyzer.py`.
+- Sorting is performed with explicit keys (not insertion order):
+	- timestamp ascending
+	- pair alphabetical
+	- original MT5 sequence within the pair
+
+Rationale:
+
+- MT5 provides sequence inside each pair stream.
+- MT5 does not define canonical ordering across different pairs when events share the same timestamp.
+- Pair-name ordering is therefore a deterministic implementation convention used to make replay results stable across operating systems, filesystems, and file discovery order.
+
 ## Notes On Approximation
 
 - Closed PnL scaling assumes approximately linear PnL-to-lot behavior.

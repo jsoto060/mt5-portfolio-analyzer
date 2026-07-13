@@ -1,2 +1,2 @@
-Initial Balance,Final Balance,Profit,Average Monthly Growth,CAGR,Max Floating Drawdown,Peak Equity Drawdown,Minimum Margin Level,Minimum Free Margin,Profit Factor,Recovery Factor,Total Trades,Winning Trades,Win Rate
-5000.0,142614.2052,137614.2052,8.30942894956938,166.1996,-40420.63,30843.098400000003,11.885,-12595.6885,2.24921166041305,3.4045536944871966,4922,2216,45.02234863876473
+Initial Balance,Final Balance,Profit,Average Monthly Growth,CAGR,Max Floating Drawdown,Peak-to-Trough Equity Drawdown,Minimum Margin Level,Minimum Free Margin,Profit Factor,Recovery Factor,Total Trades,Winning Trades,Win Rate
+5000.0,142614.9278,137614.9278,8.309441018228982,166.2,-40420.63,30843.098400000003,11.885,-12595.6885,2.249226414213289,3.4045715714970304,4922,2216,45.02234863876473

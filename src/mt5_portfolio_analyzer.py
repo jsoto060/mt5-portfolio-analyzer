@@ -50,6 +50,7 @@ class DealEvent:
     pair: str
     net_profit: float
     volume: float
+    sequence_in_pair: int = 0
 
 
 @dataclass
@@ -60,6 +61,7 @@ class TradeEvent:
     volume: float
     price: float
     side: str = ""
+    sequence_in_pair: int = 0
 
 
 @dataclass
@@ -107,6 +109,21 @@ class PairData:
         if self.scenario_config and self.scenario_config.risk_percent is not None:
             return float(self.scenario_config.risk_percent)
         return float(self.baseline_config.risk_percent)
+
+    def effective_take_profit(self) -> Optional[int]:
+        if self.scenario_config and self.scenario_config.take_profit is not None:
+            return int(self.scenario_config.take_profit)
+        return self.baseline_config.take_profit
+
+    def effective_grid_size(self) -> Optional[int]:
+        if self.scenario_config and self.scenario_config.grid_size is not None:
+            return int(self.scenario_config.grid_size)
+        return self.baseline_config.grid_size
+
+    def effective_max_trades(self) -> int:
+        if self.scenario_config and self.scenario_config.max_trades is not None:
+            return int(self.scenario_config.max_trades)
+        return int(self.baseline_config.max_trades)
 
     def __post_init__(self) -> None:
         if self.curve and not self.curve_times:
@@ -522,6 +539,7 @@ def load_pair(
             risk_std,
         )
 
+    # Preserve MT5 row order as the sequence source for deterministic replay tie-breaks.
     trades = [
         TradeEvent(
             time=d.time,
@@ -530,8 +548,9 @@ def load_pair(
             side=d.side,
             volume=d.volume,
             price=d.price,
+            sequence_in_pair=idx,
         )
-        for d in raw_deals
+        for idx, d in enumerate(raw_deals)
     ]
     out_deals = [
         DealEvent(
@@ -539,8 +558,9 @@ def load_pair(
             pair=name,
             net_profit=d.profit + d.commission + d.swap,
             volume=d.volume,
+            sequence_in_pair=idx,
         )
-        for d in raw_deals
+        for idx, d in enumerate(raw_deals)
         if d.direction == "out"
     ]
     # MT5 broker reports may charge commission on both IN and OUT legs.
@@ -552,11 +572,12 @@ def load_pair(
             pair=name,
             net_profit=d.profit + d.commission + d.swap,
             volume=d.volume,
+            sequence_in_pair=idx,
         )
-        for d in raw_deals
+        for idx, d in enumerate(raw_deals)
         if d.direction == "in" and abs(d.profit + d.commission + d.swap) > 0.0
     ]
-    deals = sorted(out_deals + in_cost_events, key=lambda ev: ev.time)
+    deals = sorted(out_deals + in_cost_events, key=lambda ev: (ev.time, ev.sequence_in_pair))
 
     if csv_path:
         raw_curve = load_graph_csv(csv_path)
@@ -741,6 +762,9 @@ class PortfolioStatistics:
             "pairs": {
                 pair_data.name: {
                     "risk_percent": pair_data.effective_risk_percent(),
+                    "take_profit": pair_data.effective_take_profit(),
+                    "grid_size": pair_data.effective_grid_size(),
+                    "max_trades": pair_data.effective_max_trades(),
                     "baseline_risk_percent": pair_data.baseline_config.risk_percent,
                     "baseline_take_profit": pair_data.baseline_config.take_profit,
                     "baseline_grid_size": pair_data.baseline_config.grid_size,
@@ -755,7 +779,7 @@ class PortfolioStatistics:
                         else None
                     ),
                     "scaled_pnl_contribution": round(pair_pnl[pair_data.name], 4),
-                    "deals_count": len(pair_data.deals),
+                    "deals_count": sum(1 for trade in pair_data.trades if trade.direction == "out"),
                 }
                 for pair_data in pairs_data
             },
@@ -840,18 +864,38 @@ class PortfolioSimulator:
             if self.margin_calculator.broker.margin_requirement_percent(pair_data.name) <= 0:
                 raise ValueError(f"Missing Forex.com margin requirement for {pair_data.name}")
 
+    @staticmethod
+    def _deal_order_key(event: DealEvent) -> Tuple[datetime, str, int]:
+        """Deterministic replay ordering key for balance-impacting deal events.
+
+        Contract:
+        1) Timestamp ascending.
+        2) Pair alphabetical (cross-pair deterministic tie-break).
+        3) Original MT5 sequence within the pair.
+
+        MT5 provides ordering within each symbol stream, but does not define a
+        canonical cross-symbol order for same-second executions. Pair ordering is
+        therefore an explicit implementation convention for deterministic replay.
+        """
+        return (event.time, event.pair, int(event.sequence_in_pair))
+
+    @staticmethod
+    def _trade_order_key(trade: TradeEvent) -> Tuple[datetime, str, int]:
+        """Deterministic replay ordering key for trade/open-close events."""
+        return (trade.time, trade.pair, int(trade.sequence_in_pair))
+
     def _build_sorted_deal_events(self) -> List[DealEvent]:
         all_events: List[DealEvent] = []
         for pair_data in self.pairs_data:
             all_events.extend(pair_data.deals)
-        all_events.sort(key=lambda event: event.time)
+        all_events.sort(key=self._deal_order_key)
         return all_events
 
     def _build_sorted_trade_events(self) -> List[TradeEvent]:
         all_trades: List[TradeEvent] = []
         for pair_data in self.pairs_data:
             all_trades.extend(pair_data.trades)
-        all_trades.sort(key=lambda trade: trade.time)
+        all_trades.sort(key=self._trade_order_key)
         return all_trades
 
     def reconstruct_balance(

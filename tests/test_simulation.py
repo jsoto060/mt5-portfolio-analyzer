@@ -20,6 +20,7 @@ from mt5_portfolio_analyzer import (  # noqa: E402
     TradeEvent,
 )
 from mt5_readers import discover_files  # noqa: E402
+from scenario import apply_scenario_overrides  # noqa: E402
 
 
 class SimulationTests(unittest.TestCase):
@@ -296,6 +297,155 @@ class BaselineInferenceTests(unittest.TestCase):
         ]
         _, risk_std = infer_baseline_config(raw_deals, initial_balance=10000.0, pair="EURUSD")
         self.assertTrue(risk_std is not None and risk_std > 0.05)
+
+
+class ReplayOrderingDeterminismTests(unittest.TestCase):
+    def _pair_with_deals(self, name: str, deals):
+        return PairData(
+            name=name,
+            baseline_config=BaselineConfig(
+                risk_percent=1.0,
+                take_profit=None,
+                grid_size=None,
+                max_trades=1,
+                initial_balance=1000.0,
+                first_lot=1.0,
+                median_lot=1.0,
+                trade_count=len(deals),
+            ),
+            deals=deals,
+            trades=[],
+            curve=[],
+            baseline_volume_median=1.0,
+            market_times=[],
+            market_close=[],
+        )
+
+    def _run(self, pairs):
+        sim = PortfolioSimulator(
+            pairs_data=pairs,
+            initial_balance=1000.0,
+            scaling=ScalingConfig(1.0, 0.1, 5.0),
+            margin_requirements={pair.name: 1.0 for pair in pairs},
+        )
+        return sim.run()
+
+    def test_two_pairs_same_timestamp_are_deterministic(self):
+        ts = datetime(2026, 1, 1, 0, 0, 0)
+        eurusd = self._pair_with_deals(
+            "EURUSD",
+            [DealEvent(time=ts, pair="EURUSD", net_profit=10.0, volume=1.0, sequence_in_pair=0)],
+        )
+        gbpusd = self._pair_with_deals(
+            "GBPUSD",
+            [DealEvent(time=ts, pair="GBPUSD", net_profit=20.0, volume=1.0, sequence_in_pair=0)],
+        )
+
+        result_a = self._run([eurusd, gbpusd])
+        result_b = self._run([gbpusd, eurusd])
+
+        self.assertEqual(result_a, result_b)
+        self.assertEqual([row["pair"] for row in result_a["event_rows"]], ["EURUSD", "GBPUSD"])
+
+    def test_three_or_more_pairs_same_timestamp_are_deterministic(self):
+        ts = datetime(2026, 1, 1, 0, 0, 0)
+        eurgbp = self._pair_with_deals(
+            "EURGBP",
+            [DealEvent(time=ts, pair="EURGBP", net_profit=5.0, volume=1.0, sequence_in_pair=0)],
+        )
+        eurusd = self._pair_with_deals(
+            "EURUSD",
+            [DealEvent(time=ts, pair="EURUSD", net_profit=10.0, volume=1.0, sequence_in_pair=0)],
+        )
+        usdcad = self._pair_with_deals(
+            "USDCAD",
+            [DealEvent(time=ts, pair="USDCAD", net_profit=-2.0, volume=1.0, sequence_in_pair=0)],
+        )
+
+        base = self._run([usdcad, eurusd, eurgbp])
+        alt = self._run([eurusd, eurgbp, usdcad])
+        alt2 = self._run([eurgbp, usdcad, eurusd])
+
+        self.assertEqual(base, alt)
+        self.assertEqual(base, alt2)
+        self.assertEqual([row["pair"] for row in base["event_rows"]], ["EURGBP", "EURUSD", "USDCAD"])
+
+    def test_same_pair_same_timestamp_preserves_mt5_sequence(self):
+        ts = datetime(2026, 1, 1, 0, 0, 0)
+        eurusd = self._pair_with_deals(
+            "EURUSD",
+            [
+                DealEvent(time=ts, pair="EURUSD", net_profit=11.0, volume=1.0, sequence_in_pair=0),
+                DealEvent(time=ts, pair="EURUSD", net_profit=22.0, volume=1.0, sequence_in_pair=1),
+                DealEvent(time=ts, pair="EURUSD", net_profit=33.0, volume=1.0, sequence_in_pair=2),
+            ],
+        )
+        gbpusd = self._pair_with_deals(
+            "GBPUSD",
+            [DealEvent(time=ts, pair="GBPUSD", net_profit=44.0, volume=1.0, sequence_in_pair=0)],
+        )
+
+        result = self._run([gbpusd, eurusd])
+        eur_rows = [row for row in result["event_rows"] if row["pair"] == "EURUSD"]
+
+        self.assertEqual([row["baseline_net_profit"] for row in eur_rows], [11.0, 22.0, 33.0])
+        self.assertEqual([row["pair"] for row in result["event_rows"]], ["EURUSD", "EURUSD", "EURUSD", "GBPUSD"])
+
+    def test_replay_results_are_identical_for_different_discovery_orders(self):
+        ts = datetime(2026, 1, 1, 0, 0, 0)
+        pairs = [
+            self._pair_with_deals("EURUSD", [DealEvent(time=ts, pair="EURUSD", net_profit=1.0, volume=1.0, sequence_in_pair=0)]),
+            self._pair_with_deals("GBPUSD", [DealEvent(time=ts, pair="GBPUSD", net_profit=2.0, volume=1.0, sequence_in_pair=0)]),
+            self._pair_with_deals("USDCHF", [DealEvent(time=ts, pair="USDCHF", net_profit=3.0, volume=1.0, sequence_in_pair=0)]),
+            self._pair_with_deals("EURGBP", [DealEvent(time=ts, pair="EURGBP", net_profit=4.0, volume=1.0, sequence_in_pair=0)]),
+        ]
+
+        result_a = self._run([pairs[0], pairs[1], pairs[2], pairs[3]])
+        result_b = self._run([pairs[3], pairs[2], pairs[1], pairs[0]])
+        result_c = self._run([pairs[1], pairs[3], pairs[0], pairs[2]])
+
+        self.assertEqual(result_a, result_b)
+        self.assertEqual(result_a, result_c)
+
+
+class ScenarioFilteringTests(unittest.TestCase):
+    def test_max_trades_filter_matches_out_events_with_side_aware_fifo(self):
+        start = datetime(2026, 1, 1, 0, 0, 0)
+        pair = PairData(
+            name="EURUSD",
+            baseline_config=BaselineConfig(
+                risk_percent=1.0,
+                take_profit=None,
+                grid_size=None,
+                max_trades=2,
+                initial_balance=1000.0,
+                first_lot=1.0,
+                median_lot=1.0,
+                trade_count=2,
+            ),
+            deals=[
+                DealEvent(time=start + timedelta(minutes=2), pair="EURUSD", net_profit=10.0, volume=1.0, sequence_in_pair=2),
+                DealEvent(time=start + timedelta(minutes=3), pair="EURUSD", net_profit=20.0, volume=1.0, sequence_in_pair=3),
+            ],
+            trades=[
+                TradeEvent(time=start + timedelta(minutes=0), pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1000, sequence_in_pair=0),
+                TradeEvent(time=start + timedelta(minutes=1), pair="EURUSD", direction="in", side="sell", volume=1.0, price=1.1001, sequence_in_pair=1),
+                TradeEvent(time=start + timedelta(minutes=2), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1002, sequence_in_pair=2),
+                TradeEvent(time=start + timedelta(minutes=3), pair="EURUSD", direction="out", side="sell", volume=1.0, price=1.1003, sequence_in_pair=3),
+            ],
+            curve=[],
+            baseline_volume_median=1.0,
+            market_times=[],
+            market_close=[],
+        )
+
+        scen = apply_scenario_overrides([pair], {"EURUSD": {"max_trades": 1}})[0]
+
+        kept_trade_seq = [int(t.sequence_in_pair) for t in scen.trades]
+        kept_deal_seq = [int(d.sequence_in_pair) for d in scen.deals]
+
+        self.assertEqual(kept_trade_seq, [0, 3])
+        self.assertEqual(kept_deal_seq, [3])
 
 
 if __name__ == "__main__":
