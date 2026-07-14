@@ -50,6 +50,7 @@ class DealEvent:
     pair: str
     net_profit: float
     volume: float
+    direction: str = "out"
     sequence_in_pair: int = 0
 
 
@@ -166,8 +167,17 @@ class Position:
     pair: str
     side: str
     lots: float
+    original_lot: float
     entry_price: float
     last_price: Optional[float] = None
+
+
+@dataclass
+class ReconstructedPosition:
+    pair: str
+    reconstructed_lot: float
+    original_lot: float
+    entry_time: datetime
 
 
 @dataclass
@@ -588,6 +598,7 @@ def load_pair(
             pair=name,
             net_profit=d.profit + d.commission + d.swap,
             volume=d.volume,
+            direction="out",
             sequence_in_pair=idx,
         )
         for idx, d in enumerate(raw_deals)
@@ -602,6 +613,7 @@ def load_pair(
             pair=name,
             net_profit=d.profit + d.commission + d.swap,
             volume=d.volume,
+            direction="in",
             sequence_in_pair=idx,
         )
         for idx, d in enumerate(raw_deals)
@@ -938,11 +950,57 @@ class PortfolioSimulator:
         balance_checkpoints: List[Tuple[datetime, float]] = [(start_time, balance)]
         pair_pnl = {pair_data.name: 0.0 for pair_data in self.pairs_data}
         event_rows: List[Dict[str, object]] = []
+        in_trades = sorted(
+            [
+                trade
+                for pair_data in self.pairs_data
+                for trade in pair_data.trades
+                if trade.direction == "in"
+            ],
+            key=self._trade_order_key,
+        )
+        in_trade_idx = 0
+        open_positions: Dict[str, List[ReconstructedPosition]] = {
+            pair_data.name: []
+            for pair_data in self.pairs_data
+        }
+        entry_lot_by_trade: Dict[Tuple[str, int], float] = {}
+
+        def process_in_trade(trade: TradeEvent) -> None:
+            pair_data = pairs_by_name[trade.pair]
+            new_lot = self.sizer.compute_new_lot(pair_data, balance)
+            open_positions[trade.pair].append(ReconstructedPosition(
+                pair=trade.pair,
+                reconstructed_lot=new_lot,
+                original_lot=max(0.0, float(trade.volume)),
+                entry_time=trade.time,
+            ))
+            entry_lot_by_trade[(trade.pair, int(trade.sequence_in_pair))] = new_lot
 
         for event in all_events:
+            event_key = (event.time, event.pair, int(event.sequence_in_pair))
+            while in_trade_idx < len(in_trades) and self._trade_order_key(in_trades[in_trade_idx]) <= event_key:
+                process_in_trade(in_trades[in_trade_idx])
+                in_trade_idx += 1
+
             pair_data = pairs_by_name[event.pair]
-            new_lot = self.sizer.compute_new_lot(pair_data, balance)
-            total_scale = self.sizer.scale_factor(pair_data, balance, event.volume)
+            if event.direction == "in":
+                new_lot = entry_lot_by_trade.get((event.pair, int(event.sequence_in_pair)))
+                if new_lot is None:
+                    new_lot = self.sizer.compute_new_lot(pair_data, balance)
+                    open_positions[event.pair].append(ReconstructedPosition(
+                        pair=event.pair,
+                        reconstructed_lot=new_lot,
+                        original_lot=max(0.0, float(event.volume)),
+                        entry_time=event.time,
+                    ))
+            else:
+                if open_positions[event.pair]:
+                    new_lot = open_positions[event.pair].pop().reconstructed_lot
+                else:
+                    new_lot = self.sizer.compute_new_lot(pair_data, balance)
+
+            total_scale = (new_lot / event.volume) if event.volume > 0 else 0.0
             scaled_pnl = event.net_profit * total_scale
 
             balance += scaled_pnl
@@ -994,32 +1052,36 @@ class PortfolioSimulator:
                 trade = all_trade_events[trade_idx]
                 trade_pair = pairs_by_name[trade.pair]
 
-                trade_bal_idx = bisect.bisect_right(checkpoint_times, trade.time) - 1
-                trade_balance = balance_checkpoints[max(trade_bal_idx, 0)][1]
-                scaled_volume = self.sizer.scale_volume(trade_pair, trade_balance, trade.volume)
-
                 if trade.direction == "in":
+                    trade_bal_idx = bisect.bisect_right(checkpoint_times, trade.time) - 1
+                    trade_balance = balance_checkpoints[max(trade_bal_idx, 0)][1]
+                    scaled_volume = self.sizer.scale_volume(trade_pair, trade_balance, trade.volume)
                     positions[trade.pair].append(Position(
                         pair=trade.pair,
                         side=trade.side,
                         lots=scaled_volume,
+                        original_lot=max(0.0, float(trade.volume)),
                         entry_price=trade.price,
                         last_price=trade.price if trade.price > 0 else None,
                     ))
                 elif trade.direction == "out":
-                    remaining = scaled_volume
-                    # FIFO close approximation using reconstructed scaled lots.
+                    remaining_original = max(0.0, float(trade.volume))
+                    # Close reconstructed positions in MT5-matching LIFO order.
                     pair_positions = positions[trade.pair]
-                    i = 0
-                    while remaining > 0 and i < len(pair_positions):
-                        open_pos = pair_positions[i]
-                        close_lots = min(open_pos.lots, remaining)
-                        open_pos.lots -= close_lots
-                        remaining -= close_lots
-                        if open_pos.lots <= 1e-12:
-                            pair_positions.pop(i)
+                    while remaining_original > 1e-12 and pair_positions:
+                        open_pos = pair_positions[-1]
+                        open_original = max(0.0, open_pos.original_lot)
+                        if open_original <= 1e-12 or open_pos.lots <= 1e-12:
+                            pair_positions.pop()
                             continue
-                        i += 1
+
+                        close_original = min(open_original, remaining_original)
+                        close_ratio = close_original / open_original if open_original > 0 else 0.0
+                        open_pos.lots -= open_pos.lots * close_ratio
+                        open_pos.original_lot -= close_original
+                        remaining_original -= close_original
+                        if open_pos.original_lot <= 1e-12 or open_pos.lots <= 1e-12:
+                            pair_positions.pop()
 
                 if trade.price > 0:
                     for open_pos in positions[trade.pair]:

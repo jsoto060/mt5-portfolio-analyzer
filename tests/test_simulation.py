@@ -408,6 +408,199 @@ class ReplayOrderingDeterminismTests(unittest.TestCase):
         self.assertEqual(result_a, result_c)
 
 
+class ReconstructedLotReplayTests(unittest.TestCase):
+    def _run(self, pairs, initial_balance=100.0):
+        sim = PortfolioSimulator(
+            pairs_data=pairs,
+            initial_balance=initial_balance,
+            scaling=ScalingConfig(1.0, 0.1, 5.0),
+            margin_requirements={pair.name: 1.0 for pair in pairs},
+        )
+        return sim.run()
+
+    def test_multiple_positions_close_with_lifo_lots(self):
+        start = datetime(2026, 1, 1, 0, 0, 0)
+        pair = PairData(
+            name="EURUSD",
+            baseline_config=BaselineConfig(
+                risk_percent=100.0,
+                take_profit=None,
+                grid_size=None,
+                max_trades=3,
+                initial_balance=150.0,
+                first_lot=1.0,
+                median_lot=1.0,
+                trade_count=3,
+            ),
+            deals=[
+                DealEvent(time=start, pair="EURUSD", net_profit=66.6667, volume=1.0, direction="in", sequence_in_pair=0),
+                DealEvent(time=start + timedelta(minutes=1), pair="EURUSD", net_profit=62.5, volume=1.0, direction="in", sequence_in_pair=1),
+                DealEvent(time=start + timedelta(minutes=2), pair="EURUSD", net_profit=0.0, volume=1.0, direction="in", sequence_in_pair=2),
+                DealEvent(time=start + timedelta(minutes=10), pair="EURUSD", net_profit=10.0, volume=1.0, direction="out", sequence_in_pair=3),
+                DealEvent(time=start + timedelta(minutes=11), pair="EURUSD", net_profit=10.0, volume=1.0, direction="out", sequence_in_pair=4),
+                DealEvent(time=start + timedelta(minutes=12), pair="EURUSD", net_profit=10.0, volume=1.0, direction="out", sequence_in_pair=5),
+            ],
+            trades=[
+                TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1000, sequence_in_pair=0),
+                TradeEvent(time=start + timedelta(minutes=1), pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1001, sequence_in_pair=1),
+                TradeEvent(time=start + timedelta(minutes=2), pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1002, sequence_in_pair=2),
+                TradeEvent(time=start + timedelta(minutes=10), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1003, sequence_in_pair=3),
+                TradeEvent(time=start + timedelta(minutes=11), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1004, sequence_in_pair=4),
+                TradeEvent(time=start + timedelta(minutes=12), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1005, sequence_in_pair=5),
+            ],
+            curve=[],
+            baseline_volume_median=1.0,
+            market_times=[],
+            market_close=[],
+        )
+
+        result = self._run([pair], initial_balance=150.0)
+        out_rows = [row for row in result["event_rows"] if row["baseline_net_profit"] == 10.0]
+
+        self.assertEqual([row["scaled_volume"] for row in out_rows], [0.17, 0.16, 0.15])
+
+    def test_out_uses_entry_lot_even_after_other_pair_changes_balance(self):
+        start = datetime(2026, 1, 1, 0, 0, 0)
+        eurusd = PairData(
+            name="EURUSD",
+            baseline_config=BaselineConfig(
+                risk_percent=100.0,
+                take_profit=None,
+                grid_size=None,
+                max_trades=1,
+                initial_balance=100.0,
+                first_lot=1.0,
+                median_lot=1.0,
+                trade_count=1,
+            ),
+            deals=[
+                DealEvent(time=start + timedelta(minutes=2), pair="EURUSD", net_profit=100.0, volume=1.0, direction="out", sequence_in_pair=1),
+            ],
+            trades=[
+                TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1000, sequence_in_pair=0),
+                TradeEvent(time=start + timedelta(minutes=2), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1002, sequence_in_pair=1),
+            ],
+            curve=[],
+            baseline_volume_median=1.0,
+            market_times=[],
+            market_close=[],
+        )
+        gbpusd = PairData(
+            name="GBPUSD",
+            baseline_config=BaselineConfig(
+                risk_percent=100.0,
+                take_profit=None,
+                grid_size=None,
+                max_trades=1,
+                initial_balance=100.0,
+                first_lot=1.0,
+                median_lot=1.0,
+                trade_count=1,
+            ),
+            deals=[
+                DealEvent(time=start + timedelta(minutes=1), pair="GBPUSD", net_profit=100.0, volume=1.0, direction="out", sequence_in_pair=1),
+            ],
+            trades=[
+                TradeEvent(time=start, pair="GBPUSD", direction="in", side="buy", volume=1.0, price=1.2000, sequence_in_pair=0),
+                TradeEvent(time=start + timedelta(minutes=1), pair="GBPUSD", direction="out", side="buy", volume=1.0, price=1.2002, sequence_in_pair=1),
+            ],
+            curve=[],
+            baseline_volume_median=1.0,
+            market_times=[],
+            market_close=[],
+        )
+
+        result = self._run([eurusd, gbpusd], initial_balance=100.0)
+        eur_row = next(row for row in result["event_rows"] if row["pair"] == "EURUSD")
+
+        self.assertEqual(eur_row["scaled_volume"], 0.1)
+        self.assertEqual(eur_row["scaled_net_profit"], 10.0)
+
+    def test_same_timestamp_out_deals_use_lifo(self):
+        start = datetime(2026, 1, 1, 0, 0, 0)
+        close_ts = start + timedelta(minutes=10)
+        pair = PairData(
+            name="EURUSD",
+            baseline_config=BaselineConfig(
+                risk_percent=100.0,
+                take_profit=None,
+                grid_size=None,
+                max_trades=3,
+                initial_balance=150.0,
+                first_lot=1.0,
+                median_lot=1.0,
+                trade_count=3,
+            ),
+            deals=[
+                DealEvent(time=start, pair="EURUSD", net_profit=66.6667, volume=1.0, direction="in", sequence_in_pair=0),
+                DealEvent(time=start + timedelta(minutes=1), pair="EURUSD", net_profit=62.5, volume=1.0, direction="in", sequence_in_pair=1),
+                DealEvent(time=start + timedelta(minutes=2), pair="EURUSD", net_profit=0.0, volume=1.0, direction="in", sequence_in_pair=2),
+                DealEvent(time=close_ts, pair="EURUSD", net_profit=10.0, volume=1.0, direction="out", sequence_in_pair=3),
+                DealEvent(time=close_ts, pair="EURUSD", net_profit=10.0, volume=1.0, direction="out", sequence_in_pair=4),
+                DealEvent(time=close_ts, pair="EURUSD", net_profit=10.0, volume=1.0, direction="out", sequence_in_pair=5),
+            ],
+            trades=[
+                TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1000, sequence_in_pair=0),
+                TradeEvent(time=start + timedelta(minutes=1), pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1001, sequence_in_pair=1),
+                TradeEvent(time=start + timedelta(minutes=2), pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1002, sequence_in_pair=2),
+                TradeEvent(time=close_ts, pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1003, sequence_in_pair=3),
+                TradeEvent(time=close_ts, pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1004, sequence_in_pair=4),
+                TradeEvent(time=close_ts, pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1005, sequence_in_pair=5),
+            ],
+            curve=[],
+            baseline_volume_median=1.0,
+            market_times=[],
+            market_close=[],
+        )
+
+        result = self._run([pair], initial_balance=150.0)
+        out_rows = [row for row in result["event_rows"] if row["time"] == close_ts.strftime("%Y.%m.%d %H:%M:%S")]
+
+        self.assertEqual([row["scaled_volume"] for row in out_rows], [0.17, 0.16, 0.15])
+
+    def test_replay_is_invariant_across_repeated_runs(self):
+        start = datetime(2026, 1, 1, 0, 0, 0)
+        pair = PairData(
+            name="EURUSD",
+            baseline_config=BaselineConfig(
+                risk_percent=100.0,
+                take_profit=None,
+                grid_size=None,
+                max_trades=2,
+                initial_balance=100.0,
+                first_lot=1.0,
+                median_lot=1.0,
+                trade_count=2,
+            ),
+            deals=[
+                DealEvent(time=start, pair="EURUSD", net_profit=0.0, volume=1.0, direction="in", sequence_in_pair=0),
+                DealEvent(time=start + timedelta(minutes=1), pair="EURUSD", net_profit=0.0, volume=1.0, direction="in", sequence_in_pair=1),
+                DealEvent(time=start + timedelta(minutes=2), pair="EURUSD", net_profit=50.0, volume=1.0, direction="out", sequence_in_pair=2),
+                DealEvent(time=start + timedelta(minutes=3), pair="EURUSD", net_profit=50.0, volume=1.0, direction="out", sequence_in_pair=3),
+            ],
+            trades=[
+                TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1000, sequence_in_pair=0),
+                TradeEvent(time=start + timedelta(minutes=1), pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1001, sequence_in_pair=1),
+                TradeEvent(time=start + timedelta(minutes=2), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1002, sequence_in_pair=2),
+                TradeEvent(time=start + timedelta(minutes=3), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1003, sequence_in_pair=3),
+            ],
+            curve=[],
+            baseline_volume_median=1.0,
+            market_times=[],
+            market_close=[],
+        )
+
+        result_a = self._run([pair], initial_balance=100.0)
+        result_b = self._run([pair], initial_balance=100.0)
+
+        out_a = [row["scaled_volume"] for row in result_a["event_rows"] if row["baseline_net_profit"] == 50.0]
+        out_b = [row["scaled_volume"] for row in result_b["event_rows"] if row["baseline_net_profit"] == 50.0]
+
+        self.assertEqual(out_a, out_b)
+        self.assertEqual(result_a["summary"]["final_balance"], result_b["summary"]["final_balance"])
+        self.assertEqual(result_a, result_b)
+
+
 class ScenarioFilteringTests(unittest.TestCase):
     def test_max_trades_filter_matches_out_events_with_side_aware_fifo(self):
         start = datetime(2026, 1, 1, 0, 0, 0)
