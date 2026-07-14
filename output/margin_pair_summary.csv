@@ -1,5 +1,5 @@
 pair,avg_used_margin,max_used_margin,avg_used_margin_contribution_pct,peak_used_margin_contribution_pct,avg_floating_pnl,worst_floating_pnl,avg_open_positions,max_open_positions,margin_events_participated,margin_events_as_largest_contributor
-EURGBP,3104.99,12277.95,37.01,100.0,-473.76,-2979.57,2.56,4,424,227
-EURUSD,2492.87,20366.59,19.65,100.0,-956.59,-22411.04,1.35,4,339,100
-GBPUSD,2302.25,20300.94,19.12,100.0,-332.62,-3430.08,0.91,3,302,76
-USDCHF,2124.13,10410.82,23.97,100.0,-695.75,-8742.22,1.93,3,404,25
+EURGBP,3155.31,12451.5,37.24,100.0,-481.5,-3015.66,2.56,4,391,198
+EURUSD,2712.74,22190.47,20.89,100.0,-1042.37,-24422.36,1.35,4,338,95
+GBPUSD,2046.72,18075.26,17.46,100.0,-294.88,-3072.78,0.91,3,283,65
+USDCHF,2154.97,10600.97,24.16,100.0,-705.82,-8903.28,1.93,3,371,41
