@@ -101,6 +101,13 @@ The analyzer writes three files to `output-dir`:
 - `combined_curve.csv`: combined time series with balance, floating PnL, equity.
 - `summary.json`: final metrics and per-pair contribution.
 
+When modeled swap is enabled, replay exports also include explicit ledger fields:
+
+- `EventType`: one of `deal_in`, `deal_out`, `swap`
+- `ModeledSwap`: per-event modeled swap impact (0 for non-swap rows)
+- `CumulativeModeledSwap`: running total of modeled swap
+- `BalanceAfterEvent`: balance immediately after the event is applied
+
 ## Deterministic Replay Event Ordering
 
 Replay ordering is explicit and does not depend on filesystem discovery order.
@@ -113,6 +120,36 @@ Implementation points:
 	- timestamp ascending
 	- pair alphabetical
 	- original MT5 sequence within the pair
+	- event type rank for ledger ties:
+		- `swap` rank 0
+		- `deal` rank 1
+
+## Replay Ledger Contract
+
+Balance replay is modeled as an explicit event ledger. Every balance-changing
+operation must be represented as an event row. Hidden or implicit balance
+adjustments are not allowed.
+
+Balance-changing event categories:
+
+- `deal_in`: entry-side deal row (includes modeled commission impacts when present in MT5 net values)
+- `deal_out`: exit-side deal row
+- `swap`: modeled daily swap event
+
+This contract keeps accounting auditable and deterministic, and prevents future
+changes from introducing implicit balance mutations outside the replay ledger.
+
+## Swap Config Notes
+
+`config/swap_rates.yaml` supports per-symbol `buy` and `sell` daily rates via:
+
+- `daily_swap_per_001_lot`
+
+Optional reserved fields are parsed for forward compatibility and currently
+ignored by replay behavior:
+
+- `effective_from`
+- `effective_to`
 
 Rationale:
 

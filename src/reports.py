@@ -68,7 +68,7 @@ def create_pair_table(summary: Dict[str, object]) -> pd.DataFrame:
 
 
 def export_summary(output_dir: str, metrics_bundle: Dict[str, object], summary_df: pd.DataFrame, replay_df: pd.DataFrame) -> None:
-    """Export summary.json, summary.csv and replay.csv."""
+    """Export summary.json, summary.csv, replay.csv and swap_summary.csv."""
     os.makedirs(output_dir, exist_ok=True)
 
     with open(os.path.join(output_dir, "summary.json"), "w", encoding="utf-8") as fh:
@@ -76,3 +76,27 @@ def export_summary(output_dir: str, metrics_bundle: Dict[str, object], summary_d
 
     summary_df.to_csv(os.path.join(output_dir, "summary.csv"), index=False)
     replay_df.to_csv(os.path.join(output_dir, "replay.csv"), index=False)
+
+    swap_columns = ["Pair", "Direction", "SwapEvents", "TotalSwap", "AverageDailySwap"]
+    if replay_df.empty or "EventType" not in replay_df.columns or "ModeledSwap" not in replay_df.columns:
+        pd.DataFrame(columns=swap_columns).to_csv(
+            os.path.join(output_dir, "swap_summary.csv"),
+            index=False,
+        )
+        return
+
+    swap_df = replay_df[replay_df["EventType"] == "swap"].copy()
+    if swap_df.empty:
+        pd.DataFrame(columns=swap_columns).to_csv(
+            os.path.join(output_dir, "swap_summary.csv"),
+            index=False,
+        )
+        return
+
+    swap_df["direction"] = swap_df.get("direction", "").astype(str)
+    swap_df["ModeledSwap"] = pd.to_numeric(swap_df["ModeledSwap"], errors="coerce").fillna(0.0)
+
+    grouped = swap_df.groupby(["pair", "direction"], dropna=False)["ModeledSwap"]
+    summary = grouped.agg(["count", "sum", "mean"]).reset_index()
+    summary.columns = ["Pair", "Direction", "SwapEvents", "TotalSwap", "AverageDailySwap"]
+    summary.to_csv(os.path.join(output_dir, "swap_summary.csv"), index=False)

@@ -16,6 +16,7 @@ import reports
 from mt5_portfolio_analyzer import load_forex_com_margin_requirements
 from replay_engine import ReplayEngine, ReplayRun
 from scenario import apply_scenario_overrides
+from swap_engine import SwapEngine
 
 
 @dataclass
@@ -80,6 +81,7 @@ class ReplayAnalyzer:
         min_scale: float = 0.1,
         max_scale: float = 5.0,
         margin_requirements: Optional[Dict[str, float]] = None,
+        swap_engine: Optional[SwapEngine] = None,
     ):
         self.engine = ReplayEngine(
             initial_balance=initial_balance,
@@ -87,6 +89,7 @@ class ReplayAnalyzer:
             min_scale=min_scale,
             max_scale=max_scale,
             margin_requirements=margin_requirements,
+            swap_engine=swap_engine,
         )
 
     def _bundle(self, name: str, run: ReplayRun) -> ReplayResult:
@@ -143,6 +146,7 @@ class ReplayAnalyzer:
 def default_analyzer_for_repo(repo_root: str) -> ReplayAnalyzer:
     """Create analyzer with default settings and optional margin requirements file."""
     margin_requirements = load_forex_com_margin_requirements(os.path.join(repo_root, "data", "reference"))
+    swap_engine = SwapEngine.from_yaml(os.path.join(repo_root, "config", "swap_rates.yaml"))
 
     return ReplayAnalyzer(
         initial_balance=5000.0,
@@ -150,5 +154,6 @@ def default_analyzer_for_repo(repo_root: str) -> ReplayAnalyzer:
         min_scale=0.1,
         max_scale=5.0,
         margin_requirements=margin_requirements,
+        swap_engine=swap_engine,
     )
 

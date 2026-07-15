@@ -102,7 +102,12 @@ def trade_statistics(event_rows: List[Dict[str, object]]) -> Dict[str, Optional[
             "profit_factor": None,
         }
 
-    pnl = pd.to_numeric(df["scaled_net_profit"], errors="coerce").fillna(0.0)
+    if "EventType" in df.columns:
+        deal_df = df[df["EventType"].astype(str).str.startswith("deal_")]
+    else:
+        deal_df = df
+
+    pnl = pd.to_numeric(deal_df["scaled_net_profit"], errors="coerce").fillna(0.0)
     wins = pnl[pnl > 0]
     losses = pnl[pnl < 0]
 

@@ -21,6 +21,7 @@ from mt5_portfolio_analyzer import (  # noqa: E402
 )
 from mt5_readers import discover_files  # noqa: E402
 from scenario import apply_scenario_overrides  # noqa: E402
+from swap_engine import SwapEngine, load_swap_rates_yaml  # noqa: E402
 
 
 class SimulationTests(unittest.TestCase):
@@ -639,6 +640,478 @@ class ScenarioFilteringTests(unittest.TestCase):
 
         self.assertEqual(kept_trade_seq, [0, 3])
         self.assertEqual(kept_deal_seq, [3])
+
+
+class ReplayLedgerContractTest(unittest.TestCase):
+    def test_explicit_event_ordering_contract_with_ties(self):
+        """Ledger ordering contract regression guard.
+
+        Expected ordering key:
+        1) Timestamp
+        2) Pair
+        3) MT5 sequence
+        4) Event type rank (swap before deal)
+        """
+        start = datetime(2026, 1, 5, 10, 0, 0)
+        tied_ts = datetime(2026, 1, 6, 0, 0, 0)
+
+        # Commission is represented as deal_in with non-zero net on entry.
+        eurusd = PairData(
+            name="EURUSD",
+            baseline_config=BaselineConfig(
+                risk_percent=100.0,
+                take_profit=None,
+                grid_size=None,
+                max_trades=1,
+                initial_balance=1000.0,
+                first_lot=1.0,
+                median_lot=1.0,
+                trade_count=1,
+            ),
+            deals=[
+                DealEvent(
+                    time=start,
+                    pair="EURUSD",
+                    net_profit=-10.0,
+                    volume=1.0,
+                    direction="in",
+                    sequence_in_pair=0,
+                ),
+                # Same timestamp/pair/sequence as swap -> event type rank decides.
+                DealEvent(
+                    time=tied_ts,
+                    pair="EURUSD",
+                    net_profit=50.0,
+                    volume=1.0,
+                    direction="out",
+                    sequence_in_pair=0,
+                ),
+            ],
+            trades=[
+                TradeEvent(
+                    time=start,
+                    pair="EURUSD",
+                    direction="in",
+                    side="buy",
+                    volume=1.0,
+                    price=1.1000,
+                    sequence_in_pair=0,
+                ),
+                TradeEvent(
+                    time=tied_ts,
+                    pair="EURUSD",
+                    direction="out",
+                    side="buy",
+                    volume=1.0,
+                    price=1.1001,
+                    sequence_in_pair=0,
+                ),
+            ],
+            curve=[],
+            baseline_volume_median=1.0,
+            market_times=[],
+            market_close=[],
+        )
+
+        gbpusd = PairData(
+            name="GBPUSD",
+            baseline_config=BaselineConfig(
+                risk_percent=100.0,
+                take_profit=None,
+                grid_size=None,
+                max_trades=1,
+                initial_balance=1000.0,
+                first_lot=1.0,
+                median_lot=1.0,
+                trade_count=1,
+            ),
+            deals=[
+                DealEvent(
+                    time=tied_ts,
+                    pair="GBPUSD",
+                    net_profit=20.0,
+                    volume=1.0,
+                    direction="out",
+                    sequence_in_pair=0,
+                ),
+            ],
+            trades=[
+                TradeEvent(
+                    time=start,
+                    pair="GBPUSD",
+                    direction="in",
+                    side="buy",
+                    volume=1.0,
+                    price=1.2000,
+                    sequence_in_pair=0,
+                ),
+                TradeEvent(
+                    time=tied_ts,
+                    pair="GBPUSD",
+                    direction="out",
+                    side="buy",
+                    volume=1.0,
+                    price=1.2002,
+                    sequence_in_pair=0,
+                ),
+            ],
+            curve=[],
+            baseline_volume_median=1.0,
+            market_times=[],
+            market_close=[],
+        )
+
+        sim = PortfolioSimulator(
+            pairs_data=[gbpusd, eurusd],
+            initial_balance=1000.0,
+            scaling=ScalingConfig(1.0, 0.1, 5.0),
+            margin_requirements={"EURUSD": 1.0, "GBPUSD": 1.0},
+            swap_engine=SwapEngine({
+                "EURUSD": {"buy": -0.1, "sell": -0.1},
+                "GBPUSD": {"buy": -0.1, "sell": -0.1},
+            }),
+        )
+        result = sim.run()
+
+        rows = [
+            (row["time"], row["pair"], row["EventType"]) for row in result["event_rows"]
+        ]
+
+        expected = [
+            ("2026.01.05 10:00:00", "EURUSD", "deal_in"),
+            ("2026.01.06 00:00:00", "EURUSD", "swap"),
+            ("2026.01.06 00:00:00", "EURUSD", "deal_out"),
+            ("2026.01.06 00:00:00", "GBPUSD", "swap"),
+            ("2026.01.06 00:00:00", "GBPUSD", "deal_out"),
+        ]
+        self.assertEqual(rows, expected)
+
+
+class SwapReplayTests(unittest.TestCase):
+    def _make_pair(
+        self,
+        name: str,
+        risk_percent: float,
+        trades,
+        deals,
+    ):
+        return PairData(
+            name=name,
+            baseline_config=BaselineConfig(
+                risk_percent=risk_percent,
+                take_profit=None,
+                grid_size=None,
+                max_trades=10,
+                initial_balance=1000.0,
+                first_lot=1.0,
+                median_lot=1.0,
+                trade_count=len([t for t in trades if t.direction == "out"]),
+            ),
+            deals=deals,
+            trades=trades,
+            curve=[],
+            baseline_volume_median=1.0,
+            market_times=[],
+            market_close=[],
+        )
+
+    def _run_with_swap(self, pairs, rates):
+        sim = PortfolioSimulator(
+            pairs_data=pairs,
+            initial_balance=1000.0,
+            scaling=ScalingConfig(1.0, 0.1, 5.0),
+            margin_requirements={pair.name: 1.0 for pair in pairs},
+            swap_engine=SwapEngine(rates),
+        )
+        return sim.run()
+
+    def test_load_swap_rates_yaml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "swap_rates.yaml")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "broker: TestBroker\n"
+                    "symbols:\n"
+                    "  EURUSD:\n"
+                    "    buy:\n"
+                    "      daily_swap_per_001_lot: -0.100\n"
+                    "    sell:\n"
+                    "      daily_swap_per_001_lot: -0.200\n"
+                )
+
+            loaded = load_swap_rates_yaml(path)
+            self.assertAlmostEqual(loaded["EURUSD"]["buy"], -0.1, places=8)
+            self.assertAlmostEqual(loaded["EURUSD"]["sell"], -0.2, places=8)
+
+    def test_one_day_position_generates_one_swap_event(self):
+        start = datetime(2026, 1, 5, 10, 0, 0)  # Monday
+        pair = self._make_pair(
+            "EURUSD",
+            100.0,
+            trades=[
+                TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1000, sequence_in_pair=0),
+                TradeEvent(time=start + timedelta(days=1), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1001, sequence_in_pair=1),
+            ],
+            deals=[
+                DealEvent(time=start + timedelta(days=1), pair="EURUSD", net_profit=0.0, volume=1.0, direction="out", sequence_in_pair=1),
+            ],
+        )
+
+        result = self._run_with_swap(
+            [pair],
+            {"EURUSD": {"buy": -0.1, "sell": -0.1}},
+        )
+        swap_rows = [r for r in result["event_rows"] if r["EventType"] == "swap"]
+        self.assertEqual(len(swap_rows), 1)
+        self.assertAlmostEqual(float(swap_rows[0]["ModeledSwap"]), -10.0, places=6)
+        self.assertIn("2026-01-05", swap_rows[0]["description"])
+
+    def test_three_day_and_weekend_positions_generate_expected_swap_days(self):
+        friday = datetime(2026, 1, 9, 10, 0, 0)  # Friday
+        monday = datetime(2026, 1, 12, 10, 0, 0)  # Monday
+        pair = self._make_pair(
+            "EURUSD",
+            100.0,
+            trades=[
+                TradeEvent(time=friday, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1000, sequence_in_pair=0),
+                TradeEvent(time=monday, pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1001, sequence_in_pair=1),
+            ],
+            deals=[
+                DealEvent(time=monday, pair="EURUSD", net_profit=0.0, volume=1.0, direction="out", sequence_in_pair=1),
+            ],
+        )
+
+        result = self._run_with_swap(
+            [pair],
+            {"EURUSD": {"buy": -0.1, "sell": -0.1}},
+        )
+        swap_rows = [r for r in result["event_rows"] if r["EventType"] == "swap"]
+        self.assertEqual(len(swap_rows), 3)
+        self.assertAlmostEqual(sum(float(r["ModeledSwap"]) for r in swap_rows), -30.0, places=6)
+        accrual_days = [r["description"].rsplit(" ", 1)[-1] for r in swap_rows]
+        self.assertEqual(accrual_days, ["2026-01-09", "2026-01-10", "2026-01-11"])
+        self.assertNotIn("2026-01-12", accrual_days)
+
+    def test_monday_to_thursday_generates_exactly_monday_to_wednesday_swaps(self):
+        monday = datetime(2026, 1, 5, 10, 0, 0)
+        thursday = datetime(2026, 1, 8, 10, 0, 0)
+        pair = self._make_pair(
+            "EURUSD",
+            100.0,
+            trades=[
+                TradeEvent(time=monday, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1000, sequence_in_pair=0),
+                TradeEvent(time=thursday, pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1001, sequence_in_pair=1),
+            ],
+            deals=[
+                DealEvent(time=thursday, pair="EURUSD", net_profit=0.0, volume=1.0, direction="out", sequence_in_pair=1),
+            ],
+        )
+
+        result = self._run_with_swap(
+            [pair],
+            {"EURUSD": {"buy": -0.1, "sell": -0.1}},
+        )
+        swap_rows = [r for r in result["event_rows"] if r["EventType"] == "swap"]
+        self.assertEqual(len(swap_rows), 3)
+        accrual_days = [r["description"].rsplit(" ", 1)[-1] for r in swap_rows]
+        self.assertEqual(accrual_days, ["2026-01-05", "2026-01-06", "2026-01-07"])
+        self.assertNotIn("2026-01-08", accrual_days)
+
+    def test_buy_and_sell_rates_are_applied(self):
+        start = datetime(2026, 1, 5, 10, 0, 0)
+        pair = self._make_pair(
+            "EURUSD",
+            100.0,
+            trades=[
+                TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1000, sequence_in_pair=0),
+                TradeEvent(time=start + timedelta(days=1), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1001, sequence_in_pair=1),
+                TradeEvent(time=start + timedelta(days=1, hours=1), pair="EURUSD", direction="in", side="sell", volume=1.0, price=1.1001, sequence_in_pair=2),
+                TradeEvent(time=start + timedelta(days=2, hours=1), pair="EURUSD", direction="out", side="sell", volume=1.0, price=1.1000, sequence_in_pair=3),
+            ],
+            deals=[
+                DealEvent(time=start + timedelta(days=1), pair="EURUSD", net_profit=0.0, volume=1.0, direction="out", sequence_in_pair=1),
+                DealEvent(time=start + timedelta(days=2, hours=1), pair="EURUSD", net_profit=0.0, volume=1.0, direction="out", sequence_in_pair=3),
+            ],
+        )
+
+        result = self._run_with_swap(
+            [pair],
+            {"EURUSD": {"buy": -0.1, "sell": -0.2}},
+        )
+
+        swap_rows = [r for r in result["event_rows"] if r["EventType"] == "swap"]
+        self.assertEqual(len(swap_rows), 2)
+        by_direction = {r["direction"]: float(r["ModeledSwap"]) for r in swap_rows}
+        self.assertAlmostEqual(by_direction["buy"], -10.0, places=6)
+        self.assertAlmostEqual(by_direction["sell"], -19.8, places=6)
+
+    def test_multiple_positions_and_pairs_generate_swap_events(self):
+        start = datetime(2026, 1, 5, 10, 0, 0)
+        close = start + timedelta(days=2)
+        eurusd = self._make_pair(
+            "EURUSD",
+            100.0,
+            trades=[
+                TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1000, sequence_in_pair=0),
+                TradeEvent(time=start + timedelta(hours=1), pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1001, sequence_in_pair=1),
+                TradeEvent(time=close, pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1002, sequence_in_pair=2),
+                TradeEvent(time=close + timedelta(hours=1), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1003, sequence_in_pair=3),
+            ],
+            deals=[
+                DealEvent(time=close, pair="EURUSD", net_profit=0.0, volume=1.0, direction="out", sequence_in_pair=2),
+                DealEvent(time=close + timedelta(hours=1), pair="EURUSD", net_profit=0.0, volume=1.0, direction="out", sequence_in_pair=3),
+            ],
+        )
+        gbpusd = self._make_pair(
+            "GBPUSD",
+            100.0,
+            trades=[
+                TradeEvent(time=start, pair="GBPUSD", direction="in", side="sell", volume=1.0, price=1.2500, sequence_in_pair=0),
+                TradeEvent(time=close, pair="GBPUSD", direction="out", side="sell", volume=1.0, price=1.2490, sequence_in_pair=1),
+            ],
+            deals=[
+                DealEvent(time=close, pair="GBPUSD", net_profit=0.0, volume=1.0, direction="out", sequence_in_pair=1),
+            ],
+        )
+
+        result = self._run_with_swap(
+            [eurusd, gbpusd],
+            {
+                "EURUSD": {"buy": -0.1, "sell": -0.1},
+                "GBPUSD": {"buy": -0.1, "sell": -0.2},
+            },
+        )
+        swap_rows = [r for r in result["event_rows"] if r["EventType"] == "swap"]
+        self.assertGreaterEqual(len(swap_rows), 5)
+        self.assertTrue(any(r["pair"] == "EURUSD" for r in swap_rows))
+        self.assertTrue(any(r["pair"] == "GBPUSD" for r in swap_rows))
+
+    def test_swap_updates_balance_before_subsequent_in_lot_sizing(self):
+        start = datetime(2026, 1, 5, 10, 0, 0)
+        pair = self._make_pair(
+            "EURUSD",
+            100.0,
+            trades=[
+                TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1000, sequence_in_pair=0),
+                TradeEvent(time=start + timedelta(days=1, hours=10), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1001, sequence_in_pair=1),
+                TradeEvent(time=start + timedelta(days=1, hours=12), pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1002, sequence_in_pair=2),
+                TradeEvent(time=start + timedelta(days=1, hours=13), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1003, sequence_in_pair=3),
+            ],
+            deals=[
+                DealEvent(time=start + timedelta(days=1, hours=10), pair="EURUSD", net_profit=0.0, volume=1.0, direction="out", sequence_in_pair=1),
+                DealEvent(time=start + timedelta(days=1, hours=13), pair="EURUSD", net_profit=100.0, volume=1.0, direction="out", sequence_in_pair=3),
+            ],
+        )
+
+        result = self._run_with_swap(
+            [pair],
+            {"EURUSD": {"buy": -0.1, "sell": -0.1}},
+        )
+
+        first_swap = next(r for r in result["event_rows"] if r["EventType"] == "swap")
+        self.assertAlmostEqual(float(first_swap["BalanceAfterEvent"]), 990.0, places=6)
+
+        second_out = [r for r in result["event_rows"] if r["EventType"] == "deal_out" and float(r["baseline_net_profit"]) == 100.0][0]
+        # Balance after swap is 990, so risk 100% produces lot round(990/1000, 2)=0.99.
+        self.assertAlmostEqual(float(second_out["scaled_volume"]), 0.99, places=6)
+
+    def test_swap_events_are_deterministic(self):
+        start = datetime(2026, 1, 5, 10, 0, 0)
+        pair = self._make_pair(
+            "EURUSD",
+            100.0,
+            trades=[
+                TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1000, sequence_in_pair=0),
+                TradeEvent(time=start + timedelta(days=2), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1001, sequence_in_pair=1),
+            ],
+            deals=[
+                DealEvent(time=start + timedelta(days=2), pair="EURUSD", net_profit=0.0, volume=1.0, direction="out", sequence_in_pair=1),
+            ],
+        )
+        rates = {"EURUSD": {"buy": -0.1, "sell": -0.1}}
+
+        a = self._run_with_swap([pair], rates)
+        b = self._run_with_swap([pair], rates)
+        self.assertEqual(a, b)
+
+
+class SwapConfigValidationTests(unittest.TestCase):
+    def test_missing_buy_rate_fails_with_symbol_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "swap_rates.yaml")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "symbols:\n"
+                    "  EURUSD:\n"
+                    "    sell:\n"
+                    "      daily_swap_per_001_lot: -0.1\n"
+                )
+
+            with self.assertRaisesRegex(ValueError, "EURUSD"):
+                load_swap_rates_yaml(path)
+
+    def test_missing_sell_rate_fails_with_symbol_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "swap_rates.yaml")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "symbols:\n"
+                    "  GBPUSD:\n"
+                    "    buy:\n"
+                    "      daily_swap_per_001_lot: -0.1\n"
+                )
+
+            with self.assertRaisesRegex(ValueError, "GBPUSD"):
+                load_swap_rates_yaml(path)
+
+    def test_invalid_numeric_fails_with_symbol_and_side_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "swap_rates.yaml")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "symbols:\n"
+                    "  EURUSD:\n"
+                    "    buy:\n"
+                    "      daily_swap_per_001_lot: bad\n"
+                    "    sell:\n"
+                    "      daily_swap_per_001_lot: -0.1\n"
+                )
+
+            with self.assertRaisesRegex(ValueError, "EURUSD\\.buy"):
+                load_swap_rates_yaml(path)
+
+    def test_malformed_yaml_fails_fast(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "swap_rates.yaml")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "symbols:\n"
+                    "  EURUSD\n"  # malformed: missing ':'
+                    "    buy:\n"
+                    "      daily_swap_per_001_lot: -0.1\n"
+                )
+
+            with self.assertRaisesRegex(ValueError, "Malformed"):
+                load_swap_rates_yaml(path)
+
+    def test_reserved_effective_window_fields_are_accepted_and_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "swap_rates.yaml")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "symbols:\n"
+                    "  EURUSD:\n"
+                    "    effective_from: 2024-01-01\n"
+                    "    effective_to: 2024-12-31\n"
+                    "    buy:\n"
+                    "      daily_swap_per_001_lot: -0.1\n"
+                    "    sell:\n"
+                    "      daily_swap_per_001_lot: -0.2\n"
+                )
+
+            loaded = load_swap_rates_yaml(path)
+            self.assertAlmostEqual(loaded["EURUSD"]["buy"], -0.1, places=8)
+            self.assertAlmostEqual(loaded["EURUSD"]["sell"], -0.2, places=8)
 
 
 if __name__ == "__main__":

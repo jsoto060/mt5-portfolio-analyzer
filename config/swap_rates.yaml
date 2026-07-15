@@ -1,0 +1,31 @@
+broker: Forex.com
+symbols:
+  EURUSD:
+    buy:
+      daily_swap_per_001_lot: -0.0867
+    sell:
+      daily_swap_per_001_lot: 0.0189
+
+  GBPUSD:
+    buy:
+      daily_swap_per_001_lot: -0.0515
+    sell:
+      daily_swap_per_001_lot: -0.0509
+
+  EURGBP:
+    buy:
+      daily_swap_per_001_lot: -0.1136
+    sell:
+      daily_swap_per_001_lot: 0.0186
+
+  USDCHF:
+    buy:
+      daily_swap_per_001_lot: 0.0945
+    sell:
+      daily_swap_per_001_lot: -0.1614
+
+metadata:
+  source: "Model input"
+  samples: "placeholder"
+  last_updated: "2026-07-14"
+  notes: "Deterministic calendar-day model; no broker rollover time or triple-swap logic."

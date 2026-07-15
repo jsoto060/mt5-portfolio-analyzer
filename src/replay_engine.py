@@ -16,6 +16,7 @@ from mt5_portfolio_analyzer import (
     build_pairs_from_auto,
     run_simulation,
 )
+from swap_engine import SwapEngine
 
 
 @dataclass
@@ -39,10 +40,12 @@ class ReplayEngine:
         min_scale: float = 0.1,
         max_scale: float = 5.0,
         margin_requirements: Optional[Dict[str, float]] = None,
+        swap_engine: Optional[SwapEngine] = None,
     ):
         self.initial_balance = initial_balance
         self.scaling = ScalingConfig(scale_exponent, min_scale, max_scale)
         self.margin_requirements = margin_requirements or {}
+        self.swap_engine = swap_engine
 
     def load_folder(self, folder: str) -> List[PairData]:
         """Load pair data from a folder using MT5 auto-discovery."""
@@ -57,6 +60,7 @@ class ReplayEngine:
             min_scale=self.scaling.min_scale,
             max_scale=self.scaling.max_scale,
             margin_requirements=self.margin_requirements,
+            swap_engine=self.swap_engine,
         )
         return ReplayRun(
             folder=os.path.abspath(folder),

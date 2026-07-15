@@ -30,10 +30,11 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from statistics import median
-from typing import Dict, List, Optional, Protocol, Tuple
+from typing import Dict, List, Optional, Protocol, Tuple, Union
 
 sys.path.insert(0, os.path.dirname(__file__))
 from mt5_readers import discover_files, load_graph_csv, load_xlsx_deals
+from swap_engine import SwapEngine, SwapEvent
 
 
 logger = logging.getLogger(__name__)
@@ -175,6 +176,7 @@ class Position:
 @dataclass
 class ReconstructedPosition:
     pair: str
+    side: str
     reconstructed_lot: float
     original_lot: float
     entry_time: datetime
@@ -855,6 +857,7 @@ class PortfolioSimulator:
         initial_balance: float,
         scaling: ScalingConfig,
         margin_requirements: Optional[Dict[str, float]] = None,
+        swap_engine: Optional[SwapEngine] = None,
         contract_size: float = 100000.0,
     ):
         self.pairs_data = pairs_data
@@ -863,6 +866,7 @@ class PortfolioSimulator:
         self.margin_calculator = MarginCalculator(
             ForexBroker(margin_requirements or {}, default_contract_size=contract_size)
         )
+        self.swap_engine = swap_engine
         self.statistics = PortfolioStatistics()
 
         self._validate_inputs()
@@ -926,6 +930,53 @@ class PortfolioSimulator:
         """Deterministic replay ordering key for trade/open-close events."""
         return (trade.time, trade.pair, int(trade.sequence_in_pair))
 
+    def _ledger_order_key(self, event: Union[DealEvent, SwapEvent]) -> Tuple[datetime, str, int, int]:
+        """Deterministic replay ordering key for balance-affecting ledger events.
+
+        Contract:
+        1) Timestamp ascending.
+        2) Pair alphabetical.
+        3) MT5 sequence in pair.
+        4) Event type tie-break using explicit rank mapping.
+
+        Event type rank mapping (explicit replay contract):
+        - 0: swap
+        - 1: deal
+
+        This mapping is intentionally explicit and must not rely on enum or
+        alphabetical ordering. If ordering semantics ever change, update both
+        this mapping and ReplayLedgerContractTest.
+        """
+        if isinstance(event, SwapEvent):
+            return (
+                event.timestamp,
+                event.pair,
+                int(event.sequence_in_pair),
+                SwapEngine.event_type_rank(),
+            )
+        return (
+            event.time,
+            event.pair,
+            int(event.sequence_in_pair),
+            SwapEngine.deal_event_type_rank(),
+        )
+
+    @staticmethod
+    def _pick_next_ledger_kind(
+        deal_key: Optional[Tuple[datetime, str, int, int]],
+        swap_key: Optional[Tuple[datetime, str, int, int]],
+    ) -> Tuple[str, Tuple[datetime, str, int, int]]:
+        """Choose next balance-affecting event kind using explicit ordering keys."""
+        if deal_key is None and swap_key is None:
+            raise ValueError("No ledger events available to pick")
+        if deal_key is None:
+            return "swap", swap_key
+        if swap_key is None:
+            return "deal", deal_key
+        if swap_key <= deal_key:
+            return "swap", swap_key
+        return "deal", deal_key
+
     def _build_sorted_deal_events(self) -> List[DealEvent]:
         all_events: List[DealEvent] = []
         for pair_data in self.pairs_data:
@@ -945,11 +996,27 @@ class PortfolioSimulator:
         pairs_by_name: Dict[str, PairData],
         all_events: List[DealEvent],
         start_time: datetime,
+        replay_end_time: datetime,
     ) -> Tuple[float, List[Tuple[datetime, float]], List[Dict[str, object]], Dict[str, float]]:
+        """Reconstruct balance as an explicit deterministic replay ledger.
+
+        Ledger contract:
+        - Every balance change is represented as an explicit event row.
+        - No hidden balance adjustments are allowed.
+        - Commission is represented as a deal event with direction='in' and
+          non-zero net profit.
+        - Modeled swap is represented as a dedicated swap event.
+
+        Event types emitted by this method:
+        - deal_in
+        - deal_out
+        - swap
+        """
         balance = self.initial_balance
         balance_checkpoints: List[Tuple[datetime, float]] = [(start_time, balance)]
         pair_pnl = {pair_data.name: 0.0 for pair_data in self.pairs_data}
         event_rows: List[Dict[str, object]] = []
+        cumulative_modeled_swap = 0.0
         in_trades = sorted(
             [
                 trade
@@ -966,22 +1033,105 @@ class PortfolioSimulator:
         }
         entry_lot_by_trade: Dict[Tuple[str, int], float] = {}
 
+        if self.swap_engine is not None:
+            self.swap_engine.reset()
+
         def process_in_trade(trade: TradeEvent) -> None:
             pair_data = pairs_by_name[trade.pair]
             new_lot = self.sizer.compute_new_lot(pair_data, balance)
             open_positions[trade.pair].append(ReconstructedPosition(
                 pair=trade.pair,
+                side=trade.side,
                 reconstructed_lot=new_lot,
                 original_lot=max(0.0, float(trade.volume)),
                 entry_time=trade.time,
             ))
             entry_lot_by_trade[(trade.pair, int(trade.sequence_in_pair))] = new_lot
+            if self.swap_engine is not None:
+                self.swap_engine.register_open_position(
+                    pair=trade.pair,
+                    direction=trade.side,
+                    original_lot=max(0.0, float(trade.volume)),
+                    reconstructed_lot=new_lot,
+                    entry_time=trade.time,
+                    sequence_in_pair=int(trade.sequence_in_pair),
+                )
 
-        for event in all_events:
-            event_key = (event.time, event.pair, int(event.sequence_in_pair))
-            while in_trade_idx < len(in_trades) and self._trade_order_key(in_trades[in_trade_idx]) <= event_key:
+        deal_idx = 0
+
+        def next_deal_event() -> Optional[DealEvent]:
+            if deal_idx >= len(all_events):
+                return None
+            return all_events[deal_idx]
+
+        def next_swap_event_key() -> Optional[Tuple[datetime, str, int, int]]:
+            if self.swap_engine is None:
+                return None
+            preview = self.swap_engine.peek_next_event()
+            if preview is None or preview.timestamp > replay_end_time:
+                return None
+            return (
+                preview.timestamp,
+                preview.pair,
+                int(preview.sequence_in_pair),
+                SwapEngine.event_type_rank(),
+            )
+
+        while True:
+            deal = next_deal_event()
+            deal_key = self._ledger_order_key(deal) if deal is not None else None
+            swap_key = next_swap_event_key()
+
+            if deal_key is None and swap_key is None:
+                break
+            chosen_type, chosen_key = self._pick_next_ledger_kind(deal_key, swap_key)
+
+            while in_trade_idx < len(in_trades) and self._trade_order_key(in_trades[in_trade_idx]) <= chosen_key[:3]:
                 process_in_trade(in_trades[in_trade_idx])
                 in_trade_idx += 1
+
+            # IN trades processed above can register newly due swap events
+            # (e.g., next-day 00:00 before a later close deal). Re-check ordering
+            # before consuming the selected deal.
+            if chosen_type == "deal":
+                swap_key_after_in = next_swap_event_key()
+                if swap_key_after_in is not None and swap_key_after_in <= chosen_key:
+                    continue
+
+            if chosen_type == "swap":
+                swap_event = self.swap_engine.pop_next_event() if self.swap_engine is not None else None
+                if swap_event is None:
+                    continue
+                if swap_event.timestamp > replay_end_time:
+                    continue
+
+                modeled_swap = float(swap_event.daily_swap)
+                balance += modeled_swap
+                cumulative_modeled_swap += modeled_swap
+                pair_pnl[swap_event.pair] += modeled_swap
+                balance_checkpoints.append((swap_event.timestamp, balance))
+
+                event_rows.append({
+                    "time": swap_event.timestamp.strftime("%Y.%m.%d %H:%M:%S"),
+                    "pair": swap_event.pair,
+                    "EventType": "swap",
+                    "description": swap_event.description,
+                    "direction": swap_event.direction,
+                    "baseline_net_profit": 0.0,
+                    "baseline_volume": round(swap_event.original_lot, 4),
+                    "new_lot": round(swap_event.reconstructed_lot, 4),
+                    "total_scale": 0.0,
+                    "scaled_net_profit": round(modeled_swap, 4),
+                    "running_balance": round(balance, 4),
+                    "scaled_volume": round(swap_event.reconstructed_lot, 4),
+                    "ModeledSwap": round(modeled_swap, 4),
+                    "CumulativeModeledSwap": round(cumulative_modeled_swap, 4),
+                    "BalanceAfterEvent": round(balance, 4),
+                })
+                continue
+
+            event = all_events[deal_idx]
+            deal_idx += 1
 
             pair_data = pairs_by_name[event.pair]
             if event.direction == "in":
@@ -990,13 +1140,26 @@ class PortfolioSimulator:
                     new_lot = self.sizer.compute_new_lot(pair_data, balance)
                     open_positions[event.pair].append(ReconstructedPosition(
                         pair=event.pair,
+                        side="buy",
                         reconstructed_lot=new_lot,
                         original_lot=max(0.0, float(event.volume)),
                         entry_time=event.time,
                     ))
+                    if self.swap_engine is not None:
+                        self.swap_engine.register_open_position(
+                            pair=event.pair,
+                            direction="buy",
+                            original_lot=max(0.0, float(event.volume)),
+                            reconstructed_lot=new_lot,
+                            entry_time=event.time,
+                            sequence_in_pair=int(event.sequence_in_pair),
+                        )
             else:
                 if open_positions[event.pair]:
-                    new_lot = open_positions[event.pair].pop().reconstructed_lot
+                    closed_pos = open_positions[event.pair].pop()
+                    new_lot = closed_pos.reconstructed_lot
+                    if self.swap_engine is not None:
+                        self.swap_engine.close_latest_position(event.pair)
                 else:
                     new_lot = self.sizer.compute_new_lot(pair_data, balance)
 
@@ -1010,6 +1173,9 @@ class PortfolioSimulator:
             event_rows.append({
                 "time": event.time.strftime("%Y.%m.%d %H:%M:%S"),
                 "pair": event.pair,
+                "EventType": "deal_in" if event.direction == "in" else "deal_out",
+                "description": "",
+                "direction": event.direction,
                 "baseline_net_profit": round(event.net_profit, 6),
                 "baseline_volume": round(event.volume, 4),
                 "new_lot": round(new_lot, 4),
@@ -1017,6 +1183,9 @@ class PortfolioSimulator:
                 "scaled_net_profit": round(scaled_pnl, 4),
                 "running_balance": round(balance, 4),
                 "scaled_volume": round(new_lot, 4),
+                "ModeledSwap": 0.0,
+                "CumulativeModeledSwap": round(cumulative_modeled_swap, 4),
+                "BalanceAfterEvent": round(balance, 4),
             })
 
         return balance, balance_checkpoints, event_rows, pair_pnl
@@ -1195,11 +1364,18 @@ class PortfolioSimulator:
             all_events[0].time,
             min(all_curve_times) if all_curve_times else all_events[0].time,
         )
+        replay_end_time = max(
+            [start_time]
+            + [event.time for event in all_events]
+            + [trade.time for trade in all_trade_events]
+            + list(all_curve_times)
+        )
 
         final_balance, balance_checkpoints, event_rows, pair_pnl = self.reconstruct_balance(
             pairs_by_name=pairs_by_name,
             all_events=all_events,
             start_time=start_time,
+            replay_end_time=replay_end_time,
         )
 
         timeline = sorted(all_curve_times.union({event.time for event in all_events}).union({trade.time for trade in all_trade_events}))
@@ -1225,7 +1401,7 @@ class PortfolioSimulator:
             margin_level_values=margin_levels,
             max_used_margin=max_used_margin,
             min_free_margin=min_free_margin,
-            event_count=len(event_rows),
+            event_count=sum(1 for row in event_rows if row.get("EventType", "").startswith("deal_")),
             start_time=start_time,
             end_time=end_time,
             pairs_data=self.pairs_data,
@@ -1247,6 +1423,7 @@ def run_simulation(
     min_scale: float,
     max_scale: float,
     margin_requirements: Optional[Dict[str, float]] = None,
+    swap_engine: Optional[SwapEngine] = None,
     contract_size: float = 100000.0,
 ) -> Dict[str, object]:
     """Backward-compatible API kept for notebook and CLI callers."""
@@ -1255,6 +1432,7 @@ def run_simulation(
         initial_balance=initial_balance,
         scaling=ScalingConfig(scale_exponent, min_scale, max_scale),
         margin_requirements=margin_requirements,
+        swap_engine=swap_engine,
         contract_size=contract_size,
     )
     return simulator.run()
@@ -1347,6 +1525,10 @@ def main() -> None:
         data_dir = os.path.abspath(args.data_dir)
         pairs_data = build_pairs_from_auto(data_dir)
         margin_requirements = load_forex_com_margin_requirements(os.path.join(os.path.dirname(data_dir), "reference"))
+        swap_rates_path = os.path.abspath(
+            os.path.join(os.path.dirname(data_dir), "..", "config", "swap_rates.yaml")
+        )
+        swap_engine = SwapEngine.from_yaml(swap_rates_path)
 
         if args.initial_balance is not None:
             initial_balance = args.initial_balance
@@ -1369,6 +1551,9 @@ def main() -> None:
 
         pairs_data = build_pairs_from_config(parsed_config)
         margin_requirements = load_forex_com_margin_requirements(os.path.join(os.path.dirname(os.path.dirname(config_path)), "data", "reference"))
+        swap_engine = SwapEngine.from_yaml(
+            os.path.abspath(os.path.join(os.path.dirname(config_path), "swap_rates.yaml"))
+        )
         initial_balance = args.initial_balance if args.initial_balance is not None else parsed_config.initial_balance
 
         scaling = ScalingConfig(
@@ -1395,6 +1580,7 @@ def main() -> None:
         min_scale=scaling.min_scale,
         max_scale=scaling.max_scale,
         margin_requirements=margin_requirements,
+        swap_engine=swap_engine,
     )
 
     # Import modular reporting stack lazily to avoid circular imports.
