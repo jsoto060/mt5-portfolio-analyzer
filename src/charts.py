@@ -106,19 +106,72 @@ def plot_pair_floating(pairs_data):
     return fig
 
 
-def plot_pair_drawdown(event_rows):
-    """Per-pair drawdown contribution based on pair cumulative contribution curves."""
-    df = _pair_cumulative_balance(event_rows)
+def build_pair_drawdown_contribution_df(curve_rows, timeline_snapshots):
+    """Build per-pair drawdown contributions on every replay timestamp.
+
+    Uses portfolio floating drawdown from the replay curve and allocates it
+    proportionally across pairs by current floating losses only.
+    """
+    curve_df = pd.DataFrame(curve_rows)
+    if curve_df.empty:
+        return pd.DataFrame(columns=["time", "pair", "drawdown_contribution", "portfolio_drawdown"])
+
+    curve_df = curve_df.copy()
+    curve_df["time"] = pd.to_datetime(curve_df["time"], format="%Y.%m.%d %H:%M", errors="coerce")
+    floating = pd.to_numeric(curve_df.get("floating_pnl", 0.0), errors="coerce").fillna(0.0)
+    curve_df["portfolio_drawdown"] = floating.where(floating < 0.0, 0.0)
+    snapshots = list(timeline_snapshots or [])
+
+    all_pairs = sorted({
+        pair
+        for snapshot in snapshots
+        for pair in snapshot.pair_snapshots.keys()
+    })
+    if not all_pairs:
+        return pd.DataFrame(columns=["time", "pair", "drawdown_contribution", "portfolio_drawdown"])
+
+    rows = []
+    for idx, row in enumerate(curve_df.itertuples(index=False)):
+        ts = row.time
+        portfolio_drawdown = float(row.portfolio_drawdown)
+        snapshot = snapshots[idx] if idx < len(snapshots) else None
+
+        pair_losses = {}
+        total_loss_abs = 0.0
+        for pair in all_pairs:
+            pair_floating = 0.0
+            if snapshot is not None and pair in snapshot.pair_snapshots:
+                pair_floating = float(snapshot.pair_snapshots[pair].floating_pnl)
+            loss_abs = abs(pair_floating) if pair_floating < 0.0 else 0.0
+            pair_losses[pair] = loss_abs
+            total_loss_abs += loss_abs
+
+        for pair in all_pairs:
+            if portfolio_drawdown < 0.0 and total_loss_abs > 0.0:
+                contribution = portfolio_drawdown * (pair_losses[pair] / total_loss_abs)
+            else:
+                contribution = 0.0
+            rows.append({
+                "time": ts,
+                "pair": pair,
+                "drawdown_contribution": contribution,
+                "portfolio_drawdown": portfolio_drawdown,
+            })
+
+    return pd.DataFrame(rows)
+
+
+def plot_pair_drawdown(curve_rows, timeline_snapshots):
+    """Per-pair drawdown contribution synchronized to replay timeline."""
+    df = build_pair_drawdown_contribution_df(curve_rows, timeline_snapshots)
     fig = go.Figure()
     if df.empty:
         return fig
 
-    for pair, group in df.groupby("pair"):
-        series = group["pair_balance"].astype(float)
-        dd = series - series.cummax()
+    for pair, group in df.groupby("pair", sort=True):
         fig.add_trace(go.Scatter(
             x=group["time"],
-            y=dd,
+            y=group["drawdown_contribution"],
             mode="lines",
             name=pair,
             line=dict(color=PAIR_COLORS.get(pair)),

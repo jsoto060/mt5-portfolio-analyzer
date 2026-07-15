@@ -55,7 +55,10 @@ class ReplayResult:
         return charts.plot_pair_floating(self.run.pairs_data)
 
     def plot_pair_drawdown(self):
-        return charts.plot_pair_drawdown(self.run.result["event_rows"])
+        return charts.plot_pair_drawdown(
+            self.run.result["curve_rows"],
+            self.run.result["timeline_snapshots"],
+        )
 
     def margin_analysis(self) -> "margin_analysis.MarginAnalysis":
         """Return a MarginAnalysis instance bound to this replay's snapshots."""

@@ -5,6 +5,7 @@ import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
+import pandas as pd
 
 sys.path.insert(0, os.path.abspath("src"))
 
@@ -12,13 +13,16 @@ from mt5_portfolio_analyzer import (  # noqa: E402
     BaselineConfig,
     CurvePoint,
     DealEvent,
+    PairPositionSnapshot,
     load_pair,
     infer_baseline_config,
     PairData,
     PortfolioSimulator,
     ScalingConfig,
+    TimelineSnapshot,
     TradeEvent,
 )
+import charts  # noqa: E402
 from mt5_readers import discover_files  # noqa: E402
 from scenario import apply_scenario_overrides  # noqa: E402
 from swap_engine import SwapEngine, load_swap_rates_yaml  # noqa: E402
@@ -218,6 +222,123 @@ class ReaderDiscoveryTests(unittest.TestCase):
             open(os.path.join(tmp, "testergraph.report.2_eurusd.csv"), "w", encoding="utf-8").close()
             with self.assertRaises(ValueError):
                 discover_files(tmp)
+
+
+class PairDrawdownContributionTests(unittest.TestCase):
+    def test_contributions_sum_to_portfolio_drawdown_per_timestamp(self):
+        t0 = datetime(2026, 1, 1, 0, 0, 0)
+        t1 = datetime(2026, 1, 1, 0, 5, 0)
+        t2 = datetime(2026, 1, 1, 0, 10, 0)
+
+        curve_rows = [
+            {"time": "2026.01.01 00:00", "floating_pnl": -80.0},
+            {"time": "2026.01.01 00:05", "floating_pnl": -50.0},
+            {"time": "2026.01.01 00:10", "floating_pnl": 25.0},
+        ]
+        timeline_snapshots = [
+            TimelineSnapshot(
+                timestamp=t0,
+                balance=1000.0,
+                equity=920.0,
+                floating_pnl=-80.0,
+                used_margin=0.0,
+                free_margin=920.0,
+                margin_level=None,
+                pair_snapshots={
+                    "EURUSD": PairPositionSnapshot("EURUSD", 1, 1.0, -100.0, 0.0),
+                    "GBPUSD": PairPositionSnapshot("GBPUSD", 1, 1.0, -20.0, 0.0),
+                    "USDCHF": PairPositionSnapshot("USDCHF", 1, 1.0, 40.0, 0.0),
+                },
+            ),
+            TimelineSnapshot(
+                timestamp=t1,
+                balance=1000.0,
+                equity=950.0,
+                floating_pnl=-50.0,
+                used_margin=0.0,
+                free_margin=950.0,
+                margin_level=None,
+                pair_snapshots={
+                    "EURUSD": PairPositionSnapshot("EURUSD", 1, 1.0, -25.0, 0.0),
+                    "GBPUSD": PairPositionSnapshot("GBPUSD", 1, 1.0, -25.0, 0.0),
+                    "USDCHF": PairPositionSnapshot("USDCHF", 0, 0.0, 0.0, 0.0),
+                },
+            ),
+            TimelineSnapshot(
+                timestamp=t2,
+                balance=1000.0,
+                equity=1025.0,
+                floating_pnl=25.0,
+                used_margin=0.0,
+                free_margin=1025.0,
+                margin_level=None,
+                pair_snapshots={
+                    "EURUSD": PairPositionSnapshot("EURUSD", 1, 1.0, 30.0, 0.0),
+                    "GBPUSD": PairPositionSnapshot("GBPUSD", 1, 1.0, -5.0, 0.0),
+                    "USDCHF": PairPositionSnapshot("USDCHF", 0, 0.0, 0.0, 0.0),
+                },
+            ),
+        ]
+
+        df = charts.build_pair_drawdown_contribution_df(curve_rows, timeline_snapshots)
+
+        self.assertFalse(df.empty)
+        grouped = df.groupby("time", as_index=False).agg(
+            contrib_sum=("drawdown_contribution", "sum"),
+            portfolio_drawdown=("portfolio_drawdown", "first"),
+        )
+        for row in grouped.itertuples(index=False):
+            self.assertAlmostEqual(float(row.contrib_sum), float(row.portfolio_drawdown), places=8)
+
+        positive_ts = pd.Timestamp("2026-01-01 00:10:00")
+        positive_rows = df[df["time"] == positive_ts]
+        self.assertTrue((positive_rows["drawdown_contribution"].abs() < 1e-12).all())
+        self.assertTrue((positive_rows["portfolio_drawdown"].abs() < 1e-12).all())
+
+    def test_contribution_df_uses_same_timestamps_as_curve(self):
+        curve_rows = [
+            {"time": "2026.01.01 00:00", "floating_pnl": 0.0},
+            {"time": "2026.01.01 00:05", "floating_pnl": -10.0},
+            {"time": "2026.01.01 00:10", "floating_pnl": -5.0},
+        ]
+        timeline_snapshots = [
+            TimelineSnapshot(
+                timestamp=datetime(2026, 1, 1, 0, 0, 0),
+                balance=1000.0,
+                equity=1000.0,
+                floating_pnl=0.0,
+                used_margin=0.0,
+                free_margin=1000.0,
+                margin_level=None,
+                pair_snapshots={"EURUSD": PairPositionSnapshot("EURUSD", 0, 0.0, 0.0, 0.0)},
+            ),
+            TimelineSnapshot(
+                timestamp=datetime(2026, 1, 1, 0, 5, 0),
+                balance=1000.0,
+                equity=990.0,
+                floating_pnl=-10.0,
+                used_margin=0.0,
+                free_margin=990.0,
+                margin_level=None,
+                pair_snapshots={"EURUSD": PairPositionSnapshot("EURUSD", 1, 1.0, -10.0, 0.0)},
+            ),
+            TimelineSnapshot(
+                timestamp=datetime(2026, 1, 1, 0, 10, 0),
+                balance=1000.0,
+                equity=995.0,
+                floating_pnl=-5.0,
+                used_margin=0.0,
+                free_margin=995.0,
+                margin_level=None,
+                pair_snapshots={"EURUSD": PairPositionSnapshot("EURUSD", 1, 1.0, -5.0, 0.0)},
+            ),
+        ]
+
+        df = charts.build_pair_drawdown_contribution_df(curve_rows, timeline_snapshots)
+
+        curve_times = sorted(set(r["time"] for r in curve_rows))
+        contrib_times = sorted(t.strftime("%Y.%m.%d %H:%M") for t in df["time"].dropna().unique())
+        self.assertEqual(curve_times, contrib_times)
 
 
 class PairLoadingTests(unittest.TestCase):
