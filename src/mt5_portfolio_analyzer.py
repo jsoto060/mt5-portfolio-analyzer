@@ -106,6 +106,9 @@ class PairData:
     curve_floating: List[float] = field(default_factory=list)
     market_times: List[datetime] = field(default_factory=list)
     market_close: List[float] = field(default_factory=list)
+    conversion_times: List[datetime] = field(default_factory=list)
+    conversion_close: List[float] = field(default_factory=list)
+    conversion_inverted: bool = False
 
     def effective_risk_percent(self) -> float:
         if self.scenario_config and self.scenario_config.risk_percent is not None:
@@ -161,6 +164,15 @@ class PairData:
         if idx < 0:
             return None
         return self.market_close[idx]
+
+    def quote_to_usd_at(self, when: datetime) -> float:
+        if _normalize_pair_key(self.name).endswith("USD"):
+            return 1.0
+        idx = bisect.bisect_right(self.conversion_times, when) - 1
+        if idx < 0 or self.conversion_close[idx] <= 0:
+            raise ValueError(f"Missing USD conversion candle for {self.name} at {when}")
+        rate = self.conversion_close[idx]
+        return 1.0 / rate if self.conversion_inverted else rate
 
 
 @dataclass
@@ -497,23 +509,28 @@ def _load_m1_market_csv(path: str) -> Tuple[List[datetime], List[float]]:
 
 def discover_reference_price_files(reference_dir: str) -> Dict[str, str]:
     """Discover pair->market price file mapping (M1/M5/M15/etc.) from reference directory."""
-    aliases = {
-        "eurusd": "EURUSD",
-        "eurgbp": "EURGBP",
-        "gbpusd": "GBPUSD",
-        "usdchf": "USDCHF",
-    }
     found: Dict[str, str] = {}
     for fname in sorted(os.listdir(reference_dir)):
         lower = fname.lower()
-        if not lower.endswith(".csv") or re.search(r"_m\d+_", lower) is None:
+        match = re.match(r"([a-z]{6})!_m\d+_", lower)
+        if not lower.endswith(".csv") or match is None:
             continue
-        for alias, pair in aliases.items():
-            if alias in lower:
-                if pair in found and found[pair] != os.path.join(reference_dir, fname):
-                    raise ValueError(f"Multiple market timeframe files matched for {pair} in {reference_dir}")
-                found[pair] = os.path.join(reference_dir, fname)
+        pair = match.group(1).upper()
+        if pair in found:
+            raise ValueError(f"Multiple market timeframe files matched for {pair} in {reference_dir}")
+        found[pair] = os.path.join(reference_dir, fname)
     return found
+
+
+def _conversion_feed(pair: str, market_files: Dict[str, str]) -> Tuple[Optional[str], bool]:
+    quote = _normalize_pair_key(pair)[-3:]
+    if quote == "USD":
+        return None, False
+    if quote + "USD" in market_files:
+        return market_files[quote + "USD"], False
+    if "USD" + quote in market_files:
+        return market_files["USD" + quote], True
+    raise ValueError(f"No USD conversion candle file found for {pair} (quote currency {quote})")
 
 
 def _parse_portfolio_config(config_obj: Dict[str, object], config_dir: str) -> PortfolioConfig:
@@ -572,6 +589,12 @@ def load_pair(
     market_csv_path: Optional[str] = None,
     scenario_config: Optional[ScenarioConfig] = None,
 ) -> PairData:
+    conversion_csv_path: Optional[str] = None
+    conversion_inverted = False
+    if market_csv_path and not _normalize_pair_key(name).endswith("USD"):
+        conversion_csv_path, conversion_inverted = _conversion_feed(
+            name, discover_reference_price_files(os.path.dirname(market_csv_path))
+        )
     raw_deals, inferred_initial_balance = load_xlsx_deals(xlsx_path, include_open=True)
     baseline_config, risk_std = infer_baseline_config(raw_deals, inferred_initial_balance, name)
     if risk_std is not None and risk_std > 0.05:
@@ -634,6 +657,13 @@ def load_pair(
     if market_csv_path and os.path.exists(market_csv_path):
         market_times, market_close = _load_m1_market_csv(market_csv_path)
 
+    conversion_times: List[datetime] = []
+    conversion_close: List[float] = []
+    if conversion_csv_path:
+        conversion_times, conversion_close = _load_m1_market_csv(conversion_csv_path)
+        if not conversion_times:
+            raise ValueError(f"No USD conversion candles loaded for {name}: {conversion_csv_path}")
+
     return PairData(
         name=name,
         baseline_config=baseline_config,
@@ -644,6 +674,9 @@ def load_pair(
         scenario_config=scenario_config,
         market_times=market_times,
         market_close=market_close,
+        conversion_times=conversion_times,
+        conversion_close=conversion_close,
+        conversion_inverted=conversion_inverted,
     )
 
 
@@ -719,7 +752,7 @@ class MarginCalculator:
     def __init__(self, broker: Broker):
         self.broker = broker
 
-    def calculate_used_margin(self, positions: Dict[str, List[Position]], current_prices: Dict[str, Optional[float]]) -> float:
+    def calculate_used_margin(self, positions: Dict[str, List[Position]], current_prices: Dict[str, Optional[float]], pair_data_by_name: Optional[Dict[str, PairData]] = None, when: Optional[datetime] = None) -> float:
         used_margin = 0.0
         for pair, pair_positions in positions.items():
             lots = sum(max(0.0, p.lots) for p in pair_positions)
@@ -733,12 +766,18 @@ class MarginCalculator:
             mmr = self.broker.margin_requirement_percent(pair)
             if mmr <= 0:
                 raise ValueError(f"Missing Forex.com margin requirement for pair: {pair}")
+            if when is None or pair_data_by_name is None or pair not in pair_data_by_name:
+                if not _normalize_pair_key(pair).endswith("USD"):
+                    raise ValueError(f"Missing USD conversion data for {pair}")
+                quote_to_usd = 1.0
+            else:
+                quote_to_usd = pair_data_by_name[pair].quote_to_usd_at(when)
             used_margin += (
                 lots
                 * self.broker.contract_size(pair)
                 * market_price
                 * mmr
-            ) / 100.0
+            ) * quote_to_usd / 100.0
         return used_margin
 
     @staticmethod
@@ -1269,17 +1308,19 @@ class PortfolioSimulator:
                 if mkt_price is None:
                     continue
 
+                quote_to_usd = pair_data.quote_to_usd_at(ts) if positions[pair_data.name] else 1.0
+
                 for open_pos in positions[pair_data.name]:
                     if open_pos.lots <= 0 or open_pos.entry_price <= 0:
                         continue
                     side = (open_pos.side or "").lower()
                     if side.startswith("sell"):
-                        floating += (open_pos.entry_price - mkt_price) * open_pos.lots * self.margin_calculator.broker.contract_size(pair_data.name)
+                        floating += (open_pos.entry_price - mkt_price) * open_pos.lots * self.margin_calculator.broker.contract_size(pair_data.name) * quote_to_usd
                     else:
-                        floating += (mkt_price - open_pos.entry_price) * open_pos.lots * self.margin_calculator.broker.contract_size(pair_data.name)
+                        floating += (mkt_price - open_pos.entry_price) * open_pos.lots * self.margin_calculator.broker.contract_size(pair_data.name) * quote_to_usd
 
             equity = current_balance + floating
-            used_margin = self.margin_calculator.calculate_used_margin(positions, current_prices)
+            used_margin = self.margin_calculator.calculate_used_margin(positions, current_prices, {p.name: p for p in self.pairs_data}, ts)
             free_margin = self.margin_calculator.calculate_free_margin(equity, used_margin)
             margin_level = self.margin_calculator.calculate_margin_level_percent(equity, used_margin)
 
@@ -1315,18 +1356,19 @@ class PortfolioSimulator:
                 pair_floating = 0.0
                 mkt_price = current_prices.get(pair_name)
                 if mkt_price is not None:
+                    quote_to_usd = pair_data.quote_to_usd_at(ts) if pair_pos_list else 1.0
                     for open_pos in pair_pos_list:
                         if open_pos.lots <= 0 or open_pos.entry_price <= 0:
                             continue
                         side = (open_pos.side or "").lower()
                         contract_size = self.margin_calculator.broker.contract_size(pair_name)
                         if side.startswith("sell"):
-                            pair_floating += (open_pos.entry_price - mkt_price) * open_pos.lots * contract_size
+                            pair_floating += (open_pos.entry_price - mkt_price) * open_pos.lots * contract_size * quote_to_usd
                         else:
-                            pair_floating += (mkt_price - open_pos.entry_price) * open_pos.lots * contract_size
+                            pair_floating += (mkt_price - open_pos.entry_price) * open_pos.lots * contract_size * quote_to_usd
 
                 pair_used_margin = self.margin_calculator.calculate_used_margin(
-                    {pair_name: pair_pos_list}, current_prices
+                    {pair_name: pair_pos_list}, current_prices, {pair_name: pair_data}, ts
                 )
 
                 pair_snapshots[pair_name] = PairPositionSnapshot(

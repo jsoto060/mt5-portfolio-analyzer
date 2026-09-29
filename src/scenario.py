@@ -99,12 +99,26 @@ def apply_scenario_overrides(pairs_data: List[PairData], overrides: OverrideMap)
 
     Only explicitly provided keys are overridden.
     """
+    available = {pair.name for pair in pairs_data}
+    missing = set(overrides) - available
+    if missing:
+        raise ValueError(f"Scenario pairs not found in folder: {', '.join(sorted(missing))}")
+
     out: List[PairData] = []
     for pair in pairs_data:
         patch = overrides.get(pair.name, {})
         if not patch:
             out.append(pair)
             continue
+
+        unknown = set(patch) - {"risk_percent", "take_profit", "grid_size", "max_trades"}
+        if unknown:
+            raise ValueError(f"Unsupported scenario fields for {pair.name}: {', '.join(sorted(unknown))}")
+        if any(patch.get(key) is not None and int(patch[key]) != getattr(pair.baseline_config, key)
+               for key in ("take_profit", "grid_size")):
+            raise ValueError(f"Changing take_profit or grid_size for {pair.name} requires a matching MT5 backtest")
+        if patch.get("max_trades") is not None and int(patch["max_trades"]) > pair.baseline_config.max_trades:
+            raise ValueError(f"Increasing max_trades for {pair.name} requires a matching MT5 backtest")
 
         cfg = ScenarioConfig(
             risk_percent=patch.get("risk_percent"),

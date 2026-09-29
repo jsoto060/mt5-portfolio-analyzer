@@ -234,6 +234,8 @@ _PAIR_ALIASES = {
     "eurgbp": "EURGBP",
     "gbpusd": "GBPUSD",
     "usdchf": "USDCHF",
+    "cadjpy": "CADJPY",
+    "nzdchf": "NZDCHF",
 }
 
 

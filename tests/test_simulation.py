@@ -13,6 +13,7 @@ from mt5_portfolio_analyzer import (  # noqa: E402
     BaselineConfig,
     CurvePoint,
     DealEvent,
+    _conversion_feed,
     PairPositionSnapshot,
     load_pair,
     infer_baseline_config,
@@ -64,6 +65,83 @@ class SimulationTests(unittest.TestCase):
         self.assertAlmostEqual(val, 0.0, places=8)
         self.assertEqual(len(pair.curve_times), 2)
         self.assertEqual(len(pair.curve_floating), 2)
+
+    def test_quote_currency_conversion_feed_direction(self):
+        feeds = {"USDJPY": "usd-jpy.csv", "USDCHF": "usd-chf.csv", "GBPUSD": "gbp-usd.csv"}
+        self.assertEqual(_conversion_feed("CADJPY", feeds), ("usd-jpy.csv", True))
+        self.assertEqual(_conversion_feed("NZDCHF", feeds), ("usd-chf.csv", True))
+        self.assertEqual(_conversion_feed("EURGBP", feeds), ("gbp-usd.csv", False))
+        self.assertEqual(_conversion_feed("EURUSD", feeds), (None, False))
+        pair = self._single_pair()
+        pair.name = "EURGBP"
+        pair.conversion_times = [pair.trades[0].time]
+        pair.conversion_close = [1.25]
+        self.assertEqual(pair.quote_to_usd_at(pair.trades[0].time), 1.25)
+        pair.conversion_inverted = True
+        self.assertEqual(pair.quote_to_usd_at(pair.trades[0].time), 0.8)
+        with self.assertRaisesRegex(ValueError, "conversion candle"):
+            _conversion_feed("AUDCAD", feeds)
+
+    def test_new_pair_scenarios_apply_and_reject_unreplayable_changes(self):
+        cadjpy = self._single_pair()
+        cadjpy.name = "CADJPY"
+        cadjpy.baseline_config = BaselineConfig(1.8, 15, 61, 3, 1000.0, 1.0, 1.0, 1)
+        nzdchf = self._single_pair()
+        nzdchf.name = "NZDCHF"
+        nzdchf.baseline_config = BaselineConfig(2.0, 10, 34, 4, 1000.0, 1.0, 1.0, 1)
+        nzdchf.conversion_times = [nzdchf.trades[0].time]
+        nzdchf.conversion_close = [0.8]
+        nzdchf.conversion_inverted = True
+
+        changed = apply_scenario_overrides(
+            [cadjpy, nzdchf],
+            {"CADJPY": {"risk_percent": 2.4, "max_trades": 2}, "NZDCHF": {"risk_percent": 2.7}},
+        )
+        self.assertEqual(changed[0].effective_risk_percent(), 2.4)
+        self.assertEqual(changed[0].effective_max_trades(), 2)
+        self.assertEqual(changed[1].effective_risk_percent(), 2.7)
+        self.assertEqual(changed[1].conversion_times, nzdchf.conversion_times)
+        self.assertEqual(changed[1].quote_to_usd_at(nzdchf.trades[0].time), 1.25)
+
+        with self.assertRaisesRegex(ValueError, "Scenario pairs not found"):
+            apply_scenario_overrides([cadjpy], {"NZDCHF": {"risk_percent": 2.7}})
+        with self.assertRaisesRegex(ValueError, "matching MT5 backtest"):
+            apply_scenario_overrides([cadjpy], {"CADJPY": {"take_profit": 30}})
+        with self.assertRaisesRegex(ValueError, "matching MT5 backtest"):
+            apply_scenario_overrides([nzdchf], {"NZDCHF": {"max_trades": 5}})
+        with self.assertRaisesRegex(ValueError, "Unsupported scenario fields"):
+            apply_scenario_overrides([cadjpy], {"CADJPY": {"risk_percnet": 2.4}})
+
+    def test_replay_converts_non_usd_quote_margin_and_floating(self):
+        start = datetime(2026, 1, 1)
+        pair = self._single_pair()
+        pair.name = "CADJPY"
+        pair.baseline_config = BaselineConfig(100.0, None, None, 1, 1000.0, 1.0, 1.0, 1)
+        pair.trades = [
+            TradeEvent(start, "CADJPY", "in", 1.0, 100.0, "buy"),
+            TradeEvent(start + timedelta(minutes=10), "CADJPY", "out", 1.0, 101.0, "sell"),
+        ]
+        pair.deals = [DealEvent(start + timedelta(minutes=10), "CADJPY", 0.0, 1.0)]
+        pair.market_times = [start, start + timedelta(minutes=5), start + timedelta(minutes=10)]
+        pair.market_close = [100.0, 101.0, 101.0]
+        pair.conversion_times = [start, start + timedelta(minutes=5)]
+        pair.conversion_close = [100.0, 150.0]
+        pair.conversion_inverted = True
+        result = PortfolioSimulator(
+            [pair], initial_balance=1000.0, scaling=ScalingConfig(),
+            margin_requirements={"CADJPY": 5.0},
+        ).run()
+        row = next(item for item in result["curve_rows"] if item["time"] == "2026.01.01 00:05")
+        self.assertAlmostEqual(row["floating_pnl"], 100000.0 / 150.0, places=4)
+        self.assertAlmostEqual(row["used_margin"], 101.0 * 100000.0 * 0.05 / 150.0, places=4)
+        self.assertAlmostEqual(row["equity"], 1000.0 + 100000.0 / 150.0, places=4)
+
+        pair.conversion_times = []
+        with self.assertRaisesRegex(ValueError, "Missing USD conversion candle"):
+            PortfolioSimulator(
+                [pair], initial_balance=1000.0, scaling=ScalingConfig(),
+                margin_requirements={"CADJPY": 5.0},
+            ).run()
 
     def test_duplicate_pair_names_raise(self):
         pair = self._single_pair()

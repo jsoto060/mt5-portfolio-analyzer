@@ -24,6 +24,18 @@ symbols:
     sell:
       daily_swap_per_001_lot: -0.1614
 
+  CADJPY:
+    buy:
+      daily_swap_per_001_lot: 0.0945
+    sell:
+      daily_swap_per_001_lot: -0.1614
+
+  NZDCHF:
+    buy:
+      daily_swap_per_001_lot: 0.0945
+    sell:
+      daily_swap_per_001_lot: -0.1614
+
 metadata:
   source: "Model input"
   samples: "placeholder"
