@@ -304,6 +304,27 @@ class ReaderDiscoveryTests(unittest.TestCase):
 
 
 class PairDrawdownContributionTests(unittest.TestCase):
+    def test_monthly_growth_reconciles_pair_events_after_market_close(self):
+        curve_rows = [
+            {"time": "2026.01.30 23:45", "balance": 1050.0},
+            {"time": "2026.02.28 23:45", "balance": 1100.0},
+            {"time": "2026.03.31 23:45", "balance": 1100.0},
+        ]
+        event_rows = [
+            {"time": "2026.01.15 12:00:00", "pair": "EURUSD", "scaled_net_profit": 50.0},
+            {"time": "2026.01.31 00:00:00", "pair": "GBPUSD", "scaled_net_profit": -10.0},
+            {"time": "2026.02.10 12:00:00", "pair": "EURUSD", "scaled_net_profit": 60.0},
+        ]
+
+        fig = charts.plot_monthly_growth(curve_rows, event_rows, 1000.0)
+        self.assertEqual(list(fig.data[-1].x), ["2026-01", "2026-02", "2026-03"])
+        for month_index, portfolio_growth in enumerate(fig.data[-1].y):
+            self.assertAlmostEqual(sum(float(bar.y[month_index]) for bar in fig.data[:-1]), float(portfolio_growth))
+        self.assertAlmostEqual(float(fig.data[-1].y[0]), 4.0)
+        self.assertAlmostEqual(float(fig.data[-1].y[1]), 60.0 / 1040.0 * 100.0)
+        self.assertEqual(float(fig.data[-1].y[2]), 0.0)
+        self.assertEqual(fig.layout.yaxis.title.text, "Growth (%)")
+
     def test_equity_chart_and_metric_use_percentage_drawdown(self):
         curve_rows = [
             {"time": "2026.01.01 00:00", "balance": 2000.0, "equity": 1900.0, "floating_pnl": -100.0},

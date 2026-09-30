@@ -87,6 +87,51 @@ def plot_pair_balance(event_rows):
     return fig
 
 
+def plot_monthly_growth(curve_rows, event_rows, initial_balance):
+    """Monthly realized growth, including swaps after the last market timestamp."""
+    fig = go.Figure()
+    curve = pd.DataFrame(curve_rows)
+    if curve.empty:
+        return fig
+
+    curve["time"] = pd.to_datetime(curve["time"], format="%Y.%m.%d %H:%M", errors="coerce")
+    curve = curve.dropna(subset=["time"]).sort_values("time")
+    if curve.empty:
+        return fig
+
+    months = pd.PeriodIndex(curve["time"].dt.to_period("M").unique()).sort_values()
+
+    events = pd.DataFrame(event_rows)
+    contributions = pd.DataFrame(index=months)
+    if not events.empty:
+        events["time"] = pd.to_datetime(events["time"], format="%Y.%m.%d %H:%M:%S", errors="coerce")
+        events["scaled_net_profit"] = pd.to_numeric(events["scaled_net_profit"], errors="coerce").fillna(0.0)
+        contributions = events.dropna(subset=["time"]).groupby([events["time"].dt.to_period("M"), "pair"])["scaled_net_profit"].sum().unstack(fill_value=0.0)
+        months = months.union(contributions.index).sort_values()
+        contributions = contributions.reindex(months, fill_value=0.0)
+
+    month_pnl = contributions.sum(axis=1)
+    month_start = (initial_balance + month_pnl.cumsum().shift(fill_value=0)).replace(0, float("nan"))
+    growth = month_pnl.div(month_start).mul(100.0)
+    for pair in sorted(contributions.columns):
+        fig.add_trace(go.Bar(
+            x=months.astype(str),
+            y=contributions[pair].div(month_start).mul(100.0),
+            name=pair,
+            marker_color=PAIR_COLORS.get(pair),
+            hovertemplate="%{x}<br>%{y:.2f}%<extra>%{fullData.name}</extra>",
+        ))
+
+    fig.add_trace(go.Scatter(
+        x=months.astype(str), y=growth, name="Portfolio growth",
+        mode="lines+markers", line=dict(color="#202124", width=2),
+        hovertemplate="%{x}<br>%{y:.2f}%<extra>Portfolio growth</extra>",
+    ))
+    fig.update_layout(title="Monthly Balance Growth by Pair", barmode="relative", template="plotly_white", yaxis_title="Growth (%)")
+    fig.update_yaxes(ticksuffix="%")
+    return fig
+
+
 def plot_pair_floating(pairs_data):
     """Per-pair standalone floating profile from imported MT5 curves."""
     fig = go.Figure()

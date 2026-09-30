@@ -51,6 +51,13 @@ class ReplayResult:
     def plot_pair_contributions(self):
         return charts.plot_pair_balance(self.run.result["event_rows"])
 
+    def plot_monthly_growth(self):
+        return charts.plot_monthly_growth(
+            self.run.result["curve_rows"],
+            self.run.result["event_rows"],
+            self.run.initial_balance,
+        )
+
     def plot_pair_floating(self):
         return charts.plot_pair_floating(self.run.pairs_data)
 
