@@ -24,6 +24,7 @@ from mt5_portfolio_analyzer import (  # noqa: E402
     TradeEvent,
 )
 import charts  # noqa: E402
+import metrics  # noqa: E402
 from mt5_readers import discover_files  # noqa: E402
 from scenario import apply_scenario_overrides  # noqa: E402
 from swap_engine import SwapEngine, load_swap_rates_yaml  # noqa: E402
@@ -303,15 +304,30 @@ class ReaderDiscoveryTests(unittest.TestCase):
 
 
 class PairDrawdownContributionTests(unittest.TestCase):
+    def test_equity_chart_and_metric_use_percentage_drawdown(self):
+        curve_rows = [
+            {"time": "2026.01.01 00:00", "balance": 2000.0, "equity": 1900.0, "floating_pnl": -100.0},
+            {"time": "2026.01.01 00:05", "balance": 1000.0, "equity": 920.0, "floating_pnl": -80.0},
+            {"time": "2026.01.01 00:10", "balance": 1000.0, "equity": 1025.0, "floating_pnl": 25.0},
+        ]
+
+        fig = charts.plot_equity(curve_rows)
+        self.assertEqual(list(fig.data[2].y), [-5.0, -8.0, 0.0])
+        self.assertEqual(fig.layout.yaxis2.title.text, "Floating Drawdown (%)")
+        self.assertEqual(fig.layout.yaxis2.ticksuffix, "%")
+        drawdown = metrics.max_floating_drawdown(curve_rows)
+        self.assertEqual(drawdown["max_floating_drawdown_percent"], -8.0)
+        self.assertEqual(drawdown["max_floating_drawdown_abs"], -100.0)
+
     def test_contributions_sum_to_portfolio_drawdown_per_timestamp(self):
         t0 = datetime(2026, 1, 1, 0, 0, 0)
         t1 = datetime(2026, 1, 1, 0, 5, 0)
         t2 = datetime(2026, 1, 1, 0, 10, 0)
 
         curve_rows = [
-            {"time": "2026.01.01 00:00", "floating_pnl": -80.0},
-            {"time": "2026.01.01 00:05", "floating_pnl": -50.0},
-            {"time": "2026.01.01 00:10", "floating_pnl": 25.0},
+            {"time": "2026.01.01 00:00", "balance": 1000.0, "floating_pnl": -80.0},
+            {"time": "2026.01.01 00:05", "balance": 2000.0, "floating_pnl": -50.0},
+            {"time": "2026.01.01 00:10", "balance": 1000.0, "floating_pnl": 25.0},
         ]
         timeline_snapshots = [
             TimelineSnapshot(
@@ -367,6 +383,11 @@ class PairDrawdownContributionTests(unittest.TestCase):
         )
         for row in grouped.itertuples(index=False):
             self.assertAlmostEqual(float(row.contrib_sum), float(row.portfolio_drawdown), places=8)
+        self.assertAlmostEqual(float(grouped.iloc[0]["portfolio_drawdown"]), -8.0)
+        self.assertAlmostEqual(float(grouped.iloc[1]["portfolio_drawdown"]), -2.5)
+        fig = charts.plot_pair_drawdown(curve_rows, timeline_snapshots)
+        self.assertEqual(fig.layout.yaxis.title.text, "Drawdown Contribution (%)")
+        self.assertAlmostEqual(float(fig.data[0].y[0]), -100.0 / 120.0 * 8.0)
 
         positive_ts = pd.Timestamp("2026-01-01 00:10:00")
         positive_rows = df[df["time"] == positive_ts]
@@ -375,9 +396,9 @@ class PairDrawdownContributionTests(unittest.TestCase):
 
     def test_contribution_df_uses_same_timestamps_as_curve(self):
         curve_rows = [
-            {"time": "2026.01.01 00:00", "floating_pnl": 0.0},
-            {"time": "2026.01.01 00:05", "floating_pnl": -10.0},
-            {"time": "2026.01.01 00:10", "floating_pnl": -5.0},
+            {"time": "2026.01.01 00:00", "balance": 1000.0, "floating_pnl": 0.0},
+            {"time": "2026.01.01 00:05", "balance": 1000.0, "floating_pnl": -10.0},
+            {"time": "2026.01.01 00:10", "balance": 1000.0, "floating_pnl": -5.0},
         ]
         timeline_snapshots = [
             TimelineSnapshot(

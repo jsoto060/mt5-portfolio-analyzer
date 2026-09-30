@@ -1664,11 +1664,7 @@ def main() -> None:
     logger.info("Deals replayed:  %s", summary["total_deals"])
     logger.info("Final balance:   %s", f"{summary['final_balance']:,.2f}")
     logger.info("Total return:    %s%%", f"{summary['total_return_percent']:.2f}")
-    logger.info(
-        "Max DD (equity): %s%%  (%s)",
-        f"{summary['max_drawdown_percent']:.2f}",
-        f"{summary['max_drawdown_abs']:,.2f}",
-    )
+    logger.info("Max DD (equity): %s%%", f"{summary['max_drawdown_percent']:.2f}")
     logger.info("CAGR:            %s%%", f"{summary['cagr_percent']:.2f}")
     logger.info("Output written to: %s", output_dir)
 

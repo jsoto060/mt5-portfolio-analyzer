@@ -24,15 +24,17 @@ def plot_equity(curve_rows):
         return go.Figure()
 
     df["time"] = pd.to_datetime(df["time"], format="%Y.%m.%d %H:%M", errors="coerce")
-    df["drawdown"] = pd.to_numeric(df.get("floating_pnl", 0.0), errors="coerce").fillna(0.0)
+    balance = pd.to_numeric(df["balance"], errors="coerce").replace(0, float("nan"))
+    floating = pd.to_numeric(df.get("floating_pnl", 0.0), errors="coerce").fillna(0.0)
+    df["drawdown"] = floating.where(floating < 0.0, 0.0).div(balance).mul(100.0)
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Scatter(x=df["time"], y=df["balance"], name="Balance", line=dict(width=2)), secondary_y=False)
     fig.add_trace(go.Scatter(x=df["time"], y=df["equity"], name="Equity", line=dict(width=2)), secondary_y=False)
-    fig.add_trace(go.Scatter(x=df["time"], y=df["drawdown"], name="Drawdown", line=dict(width=1.5, dash="dot")), secondary_y=True)
+    fig.add_trace(go.Scatter(x=df["time"], y=df["drawdown"], name="Drawdown %", line=dict(width=1.5, dash="dot")), secondary_y=True)
     fig.update_layout(title="Combined Balance, Equity, and Drawdown", template="plotly_white")
     fig.update_yaxes(title_text="Balance / Equity", secondary_y=False)
-    fig.update_yaxes(title_text="Floating Drawdown", secondary_y=True)
+    fig.update_yaxes(title_text="Floating Drawdown (%)", ticksuffix="%", secondary_y=True)
     return fig
 
 
@@ -107,7 +109,7 @@ def plot_pair_floating(pairs_data):
 
 
 def build_pair_drawdown_contribution_df(curve_rows, timeline_snapshots):
-    """Build per-pair drawdown contributions on every replay timestamp.
+    """Build per-pair percentage-point drawdown contributions on every replay timestamp.
 
     Uses portfolio floating drawdown from the replay curve and allocates it
     proportionally across pairs by current floating losses only.
@@ -119,7 +121,8 @@ def build_pair_drawdown_contribution_df(curve_rows, timeline_snapshots):
     curve_df = curve_df.copy()
     curve_df["time"] = pd.to_datetime(curve_df["time"], format="%Y.%m.%d %H:%M", errors="coerce")
     floating = pd.to_numeric(curve_df.get("floating_pnl", 0.0), errors="coerce").fillna(0.0)
-    curve_df["portfolio_drawdown"] = floating.where(floating < 0.0, 0.0)
+    balance = pd.to_numeric(curve_df["balance"], errors="coerce").replace(0, float("nan"))
+    curve_df["portfolio_drawdown"] = floating.where(floating < 0.0, 0.0).div(balance).mul(100.0)
     snapshots = list(timeline_snapshots or [])
 
     all_pairs = sorted({
@@ -177,7 +180,8 @@ def plot_pair_drawdown(curve_rows, timeline_snapshots):
             line=dict(color=PAIR_COLORS.get(pair)),
         ))
 
-    fig.update_layout(title="Per-Pair Drawdown Contribution", template="plotly_white")
+    fig.update_layout(title="Per-Pair Drawdown Contribution", template="plotly_white", yaxis_title="Drawdown Contribution (%)")
+    fig.update_yaxes(ticksuffix="%")
     return fig
 
 

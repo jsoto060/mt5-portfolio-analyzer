@@ -59,10 +59,8 @@ def max_floating_drawdown(curve_rows: List[Dict[str, object]]) -> Dict[str, Opti
     balance = pd.to_numeric(df.get("balance", 0.0), errors="coerce").replace(0, pd.NA)
 
     min_floating = float(floating.min()) if len(floating) else None
-    min_idx = int(floating.idxmin()) if len(floating) else None
-    pct = None
-    if min_idx is not None and min_idx in balance.index and pd.notna(balance.loc[min_idx]):
-        pct = float((floating.loc[min_idx] / balance.loc[min_idx]) * 100.0)
+    percentages = floating.where(floating < 0.0, 0.0).div(balance).mul(100.0)
+    pct = float(percentages.min()) if percentages.notna().any() else None
 
     return {
         "max_floating_drawdown_abs": min_floating,
