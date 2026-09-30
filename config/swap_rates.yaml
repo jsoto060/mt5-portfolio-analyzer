@@ -32,9 +32,9 @@ symbols:
 
   NZDCHF:
     buy:
-      daily_swap_per_001_lot: 0.0945
+      daily_swap_per_001_lot: 0.0398873
     sell:
-      daily_swap_per_001_lot: -0.1614
+      daily_swap_per_001_lot: -0.0681250
 
 metadata:
   source: "Model input"
