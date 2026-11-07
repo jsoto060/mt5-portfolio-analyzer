@@ -2,42 +2,42 @@ broker: Forex.com
 symbols:
   EURUSD:
     buy:
-      daily_swap_per_001_lot: -0.0867
+      daily_swap_per_001_lot: -0.10987342
     sell:
-      daily_swap_per_001_lot: 0.0189
+      daily_swap_per_001_lot: 0.00807717
 
   GBPUSD:
     buy:
-      daily_swap_per_001_lot: -0.0515
+      daily_swap_per_001_lot: -0.04503434
     sell:
-      daily_swap_per_001_lot: -0.0509
+      daily_swap_per_001_lot: -0.04361257
 
   EURGBP:
     buy:
-      daily_swap_per_001_lot: -0.1136
+      daily_swap_per_001_lot: -0.08701561
     sell:
-      daily_swap_per_001_lot: 0.0186
+      daily_swap_per_001_lot: 0.01134831
 
   USDCHF:
     buy:
-      daily_swap_per_001_lot: 0.0945
+      daily_swap_per_001_lot: 0.05671429
     sell:
-      daily_swap_per_001_lot: -0.1614
+      daily_swap_per_001_lot: -0.14602058
 
   CADJPY:
     buy:
-      daily_swap_per_001_lot: 0.0945
+      daily_swap_per_001_lot: -0.00270833
     sell:
-      daily_swap_per_001_lot: -0.1614
+      daily_swap_per_001_lot: -0.06036458
 
   NZDCHF:
     buy:
-      daily_swap_per_001_lot: 0.0398873
+      daily_swap_per_001_lot: 0.01912000
     sell:
-      daily_swap_per_001_lot: -0.0681250
+      daily_swap_per_001_lot: -0.09879121
 
 metadata:
-  source: "Model input"
-  samples: "placeholder"
-  last_updated: "2026-07-14"
-  notes: "Deterministic calendar-day model; no broker rollover time or triple-swap logic."
+  source: "data/reference/ReportHistory-24886112.xlsx; Deals balance entries >Swap #<position> matched to closed Positions"
+  samples: "267 closed positions; 840 swap postings; 2026-03-17 through 2026-11-05; USD account"
+  last_updated: "2026-11-06"
+  notes: "Exposure-weighted effective rate = total swap USD / sum((lots / 0.01) * calendar days held), per symbol and side. Includes zero-charge days. Excludes 6 open positions and their 138 swap postings; ledger extends past report header date. CADJPY buy has only 2 positions and 2 postings. No USDJPY observations. Model has no broker rollover time or triple-swap logic; rates are historical averages, not current broker quotes."
