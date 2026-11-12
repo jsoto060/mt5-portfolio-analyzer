@@ -259,6 +259,21 @@ class SwapEngine:
         if position is not None:
             position.active = False
 
+    def close_position_volume(self, pair: str, sequence_in_pair: int, original_volume: float) -> None:
+        stack = self._positions_by_pair.get(str(pair).upper(), [])
+        for position_id in reversed(stack):
+            position = self._positions[position_id]
+            if position.sequence_in_pair != sequence_in_pair:
+                continue
+            closed = min(position.original_lot, max(0.0, original_volume))
+            if position.original_lot > 0:
+                position.reconstructed_lot *= 1.0 - closed / position.original_lot
+            position.original_lot -= closed
+            if position.original_lot <= 1e-12:
+                position.active = False
+                stack.remove(position_id)
+            return
+
     def _peek_active_preview(self) -> Optional[Tuple[int, _SwapEventPreview]]:
         while self._due_heap:
             ts, pair, seq, position_id = self._due_heap[0]

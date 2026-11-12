@@ -1,4 +1,4 @@
 pair,avg_used_margin,max_used_margin,avg_used_margin_contribution_pct,peak_used_margin_contribution_pct,avg_floating_pnl,worst_floating_pnl,avg_open_positions,max_open_positions,margin_events_participated,margin_events_as_largest_contributor
-CADJPY,973.06,4629.36,28.22,100.0,-406.44,-3111.92,1.38,3,134,45
-EURUSD,1461.4,7946.0,33.94,100.0,-610.56,-7808.77,1.46,4,160,102
-NZDCHF,1030.78,2891.2,36.25,100.0,-359.99,-3215.52,2.2,5,171,25
+CADJPY,1050.5,5131.78,34.68,100.0,-436.24,-3304.41,1.38,3,100,34
+EURUSD,469.11,13940.7,15.47,100.0,-32.59,-5201.74,1.1,4,99,45
+NZDCHF,1101.4,3142.61,48.23,100.0,-382.74,-3408.85,2.2,5,110,31

@@ -31,6 +31,48 @@ from swap_engine import SwapEngine, load_swap_rates_yaml  # noqa: E402
 
 
 class SimulationTests(unittest.TestCase):
+    def test_per_entry_sizing_preserves_grid_lots_and_scales_portfolio_balance(self):
+        start = datetime(2026, 1, 1)
+        pair = PairData(
+            name="EURUSD",
+            baseline_config=BaselineConfig(1.2, None, None, 3, 5000.0, 0.02, 0.07, 3),
+            deals=[
+                DealEvent(start + timedelta(minutes=4), "EURUSD", 14.0, 0.14, sequence_in_pair=3),
+                DealEvent(start + timedelta(minutes=5), "EURUSD", 7.0, 0.07, sequence_in_pair=4),
+                DealEvent(start + timedelta(minutes=6), "EURUSD", 2.0, 0.02, sequence_in_pair=5),
+            ],
+            trades=[
+                TradeEvent(start, "EURUSD", "in", 0.02, 1.1, "buy", 0),
+                TradeEvent(start + timedelta(minutes=1), "EURUSD", "in", 0.07, 1.1, "buy", 1),
+                TradeEvent(start + timedelta(minutes=2), "EURUSD", "in", 0.14, 1.1, "buy", 2),
+                TradeEvent(start + timedelta(minutes=4), "EURUSD", "out", 0.14, 1.1, "sell", 3),
+                TradeEvent(start + timedelta(minutes=5), "EURUSD", "out", 0.07, 1.1, "sell", 4),
+                TradeEvent(start + timedelta(minutes=6), "EURUSD", "out", 0.02, 1.1, "sell", 5),
+            ],
+            curve=[],
+            baseline_volume_median=0.07,
+            market_times=[start, start + timedelta(minutes=3), start + timedelta(minutes=6)],
+            market_close=[1.1, 1.1, 1.1],
+        )
+        for balance, risk, multiplier in [(5000.0, None, 1.0), (10000.0, None, 2.0),
+                                          (5000.0, 2.4, 2.0), (5000.0, 0.0, 0.0)]:
+            with self.subTest(balance=balance, risk=risk):
+                replay_pair = pair if risk is None else apply_scenario_overrides(
+                    [pair], {"EURUSD": {"risk_percent": risk}},
+                )[0]
+                result = PortfolioSimulator(
+                    [replay_pair], initial_balance=balance, scaling=ScalingConfig(),
+                    margin_requirements={"EURUSD": 1.0},
+                ).run()
+                self.assertEqual(
+                    [row["new_lot"] for row in result["event_rows"]],
+                    [round(lot * multiplier, 2) for lot in [0.14, 0.07, 0.02]],
+                )
+                self.assertAlmostEqual(result["summary"]["final_balance"], balance + 23.0 * multiplier)
+                snapshot = next(item for item in result["timeline_snapshots"]
+                                if item.timestamp == start + timedelta(minutes=3))
+                self.assertAlmostEqual(snapshot.pair_snapshots["EURUSD"].total_lots, 0.23 * multiplier)
+
     def _single_pair(self):
         start = datetime(2026, 1, 1, 0, 0, 0)
         return PairData(
@@ -58,6 +100,75 @@ class SimulationTests(unittest.TestCase):
             market_times=[start, start + timedelta(minutes=5)],
             market_close=[1.1, 1.1],
         )
+
+    def test_grid_closes_match_original_volume_and_keep_partial_entry_scale(self):
+        start = datetime(2026, 1, 1)
+        pair = PairData(
+            name="EURUSD",
+            baseline_config=BaselineConfig(1.2, None, None, 2, 5000.0, 0.02, 0.08, 3),
+            deals=[
+                DealEvent(start + timedelta(minutes=2), "EURUSD", -5.0, 0.02, sequence_in_pair=2),
+                DealEvent(start + timedelta(minutes=3), "EURUSD", 10.0, 0.07, sequence_in_pair=3),
+                DealEvent(start + timedelta(minutes=5), "EURUSD", 20.0, 0.07, sequence_in_pair=4),
+            ],
+            trades=[
+                TradeEvent(start, "EURUSD", "in", 0.02, 1.1, "buy", 0),
+                TradeEvent(start + timedelta(minutes=1), "EURUSD", "in", 0.14, 1.1, "buy", 1),
+                TradeEvent(start + timedelta(minutes=2), "EURUSD", "out", 0.02, 1.1, "sell", 2),
+                TradeEvent(start + timedelta(minutes=3), "EURUSD", "out", 0.07, 1.1, "sell", 3),
+                TradeEvent(start + timedelta(minutes=5), "EURUSD", "out", 0.07, 1.1, "sell", 4),
+            ],
+            curve=[], baseline_volume_median=0.07,
+            market_times=[start, start + timedelta(minutes=4)], market_close=[1.1, 1.1],
+        )
+        swap_engine = SwapEngine({"EURUSD": {"buy": -0.1, "sell": 0.0}})
+        result = PortfolioSimulator(
+            [pair], initial_balance=10000.0, scaling=ScalingConfig(),
+            margin_requirements={"EURUSD": 1.0},
+            swap_engine=swap_engine,
+        ).run()
+        self.assertEqual([row["new_lot"] for row in result["event_rows"]], [0.04, 0.14, 0.14])
+        self.assertAlmostEqual(result["summary"]["final_balance"], 10050.0)
+        snapshot = next(item for item in result["timeline_snapshots"]
+                        if item.timestamp == start + timedelta(minutes=4))
+        self.assertEqual(snapshot.pair_snapshots["EURUSD"].total_lots, 0.14)
+
+    def test_partial_close_reduces_modeled_swap_lots(self):
+        engine = SwapEngine({"EURUSD": {"buy": -0.1, "sell": 0.0}})
+        engine.register_open_position("EURUSD", "buy", 0.14, 0.28, datetime(2026, 1, 1), 7)
+        engine.close_position_volume("EURUSD", 7, 0.07)
+        event = engine.pop_next_event()
+        self.assertIsNotNone(event)
+        self.assertAlmostEqual(event.original_lot, 0.07)
+        self.assertAlmostEqual(event.reconstructed_lot, 0.14)
+        self.assertAlmostEqual(event.daily_swap, -1.4)
+        engine.close_position_volume("EURUSD", 7, 0.07)
+        self.assertIsNone(engine.peek_next_event())
+
+    def test_entry_sizing_includes_prior_modeled_swap(self):
+        start = datetime(2026, 1, 1, 12)
+        pair = PairData(
+            name="EURUSD",
+            baseline_config=BaselineConfig(100.0, None, None, 2, 1000.0, 1.0, 1.0, 2),
+            trades=[
+                TradeEvent(start, "EURUSD", "in", 1.0, 1.1, "buy", 0),
+                TradeEvent(start + timedelta(days=1), "EURUSD", "in", 1.0, 1.1, "buy", 1),
+                TradeEvent(start + timedelta(days=1, hours=1), "EURUSD", "out", 1.0, 1.1, "sell", 2),
+                TradeEvent(start + timedelta(days=1, hours=2), "EURUSD", "out", 1.0, 1.1, "sell", 3),
+            ],
+            deals=[
+                DealEvent(start + timedelta(days=1, hours=1), "EURUSD", 0.0, 1.0, sequence_in_pair=2),
+                DealEvent(start + timedelta(days=1, hours=2), "EURUSD", 0.0, 1.0, sequence_in_pair=3),
+            ],
+            curve=[], baseline_volume_median=1.0,
+        )
+        sim = PortfolioSimulator(
+            [pair], 1000.0, ScalingConfig(), margin_requirements={"EURUSD": 1.0},
+            swap_engine=SwapEngine({"EURUSD": {"buy": -0.1, "sell": 0.0}}),
+        )
+        sim.run()
+        self.assertEqual([sim._entry_lots[id(trade)] for trade in pair.trades if trade.direction == "in"],
+                         [1.0, 0.99])
 
     def test_pairdata_interpolation_uses_cached_arrays(self):
         pair = self._single_pair()
@@ -462,6 +573,33 @@ class PairDrawdownContributionTests(unittest.TestCase):
 
 
 class PairLoadingTests(unittest.TestCase):
+    def test_entry_balances_follow_report_sequence_and_entry_commissions(self):
+        start = datetime(2026, 1, 1)
+        raw_deals = [
+            SimpleNamespace(time=start, direction="in", side="buy", volume=0.02, price=1.1,
+                            profit=0.0, commission=-0.15, swap=0.0, balance=4999.85),
+            SimpleNamespace(time=start, direction="in", side="buy", volume=0.07, price=1.1,
+                            profit=0.0, commission=-0.52, swap=0.0, balance=0.0),
+            SimpleNamespace(time=start, direction="out", side="sell", volume=0.02, price=1.1,
+                            profit=100.67, commission=0.0, swap=0.0, balance=5100.0),
+            SimpleNamespace(time=start, direction="in", side="buy", volume=0.14, price=1.1,
+                            profit=0.0, commission=-1.05, swap=0.0, balance=5098.95),
+        ]
+        with patch("mt5_portfolio_analyzer.load_xlsx_deals", return_value=(raw_deals, 5000.0)):
+            pair = load_pair("EURUSD", "dummy.xlsx")
+        self.assertEqual([trade.baseline_balance for trade in pair.trades if trade.direction == "in"],
+                         [5000.0, 4999.85, 5100.0])
+        sim = PortfolioSimulator([pair], 5000.0, ScalingConfig(), margin_requirements={"EURUSD": 1.0})
+        result = sim.run()
+        self.assertEqual([sim._entry_lots[id(trade)] for trade in pair.trades if trade.direction == "in"],
+                         [0.02, 0.07, 0.14])
+        snapshot = result["timeline_snapshots"][-1].pair_snapshots["EURUSD"]
+        self.assertEqual(snapshot.total_lots, 0.21)
+        self.assertAlmostEqual(result["summary"]["final_balance"], 5098.95)
+        capped = apply_scenario_overrides([pair], {"EURUSD": {"max_trades": 1}})[0]
+        self.assertEqual([trade.baseline_balance for trade in capped.trades if trade.direction == "in"],
+                         [5000.0, 5100.0])
+
     def test_load_pair_includes_non_zero_in_commission_events(self):
         start = datetime(2026, 1, 1, 0, 0, 0)
         raw_deals = [
@@ -670,25 +808,25 @@ class ReconstructedLotReplayTests(unittest.TestCase):
                 grid_size=None,
                 max_trades=3,
                 initial_balance=150.0,
-                first_lot=1.0,
-                median_lot=1.0,
+                first_lot=0.15,
+                median_lot=0.16,
                 trade_count=3,
             ),
             deals=[
-                DealEvent(time=start, pair="EURUSD", net_profit=66.6667, volume=1.0, direction="in", sequence_in_pair=0),
-                DealEvent(time=start + timedelta(minutes=1), pair="EURUSD", net_profit=62.5, volume=1.0, direction="in", sequence_in_pair=1),
-                DealEvent(time=start + timedelta(minutes=2), pair="EURUSD", net_profit=0.0, volume=1.0, direction="in", sequence_in_pair=2),
-                DealEvent(time=start + timedelta(minutes=10), pair="EURUSD", net_profit=10.0, volume=1.0, direction="out", sequence_in_pair=3),
-                DealEvent(time=start + timedelta(minutes=11), pair="EURUSD", net_profit=10.0, volume=1.0, direction="out", sequence_in_pair=4),
-                DealEvent(time=start + timedelta(minutes=12), pair="EURUSD", net_profit=10.0, volume=1.0, direction="out", sequence_in_pair=5),
+                DealEvent(time=start, pair="EURUSD", net_profit=66.6667, volume=0.15, direction="in", sequence_in_pair=0),
+                DealEvent(time=start + timedelta(minutes=1), pair="EURUSD", net_profit=62.5, volume=0.16, direction="in", sequence_in_pair=1),
+                DealEvent(time=start + timedelta(minutes=2), pair="EURUSD", net_profit=0.0, volume=0.17, direction="in", sequence_in_pair=2),
+                DealEvent(time=start + timedelta(minutes=10), pair="EURUSD", net_profit=10.0, volume=0.17, direction="out", sequence_in_pair=3),
+                DealEvent(time=start + timedelta(minutes=11), pair="EURUSD", net_profit=10.0, volume=0.16, direction="out", sequence_in_pair=4),
+                DealEvent(time=start + timedelta(minutes=12), pair="EURUSD", net_profit=10.0, volume=0.15, direction="out", sequence_in_pair=5),
             ],
             trades=[
-                TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1000, sequence_in_pair=0),
-                TradeEvent(time=start + timedelta(minutes=1), pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1001, sequence_in_pair=1),
-                TradeEvent(time=start + timedelta(minutes=2), pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1002, sequence_in_pair=2),
-                TradeEvent(time=start + timedelta(minutes=10), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1003, sequence_in_pair=3),
-                TradeEvent(time=start + timedelta(minutes=11), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1004, sequence_in_pair=4),
-                TradeEvent(time=start + timedelta(minutes=12), pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1005, sequence_in_pair=5),
+                TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=0.15, price=1.1000, sequence_in_pair=0),
+                TradeEvent(time=start + timedelta(minutes=1), pair="EURUSD", direction="in", side="buy", volume=0.16, price=1.1001, sequence_in_pair=1),
+                TradeEvent(time=start + timedelta(minutes=2), pair="EURUSD", direction="in", side="buy", volume=0.17, price=1.1002, sequence_in_pair=2),
+                TradeEvent(time=start + timedelta(minutes=10), pair="EURUSD", direction="out", side="buy", volume=0.17, price=1.1003, sequence_in_pair=3),
+                TradeEvent(time=start + timedelta(minutes=11), pair="EURUSD", direction="out", side="buy", volume=0.16, price=1.1004, sequence_in_pair=4),
+                TradeEvent(time=start + timedelta(minutes=12), pair="EURUSD", direction="out", side="buy", volume=0.15, price=1.1005, sequence_in_pair=5),
             ],
             curve=[],
             baseline_volume_median=1.0,
@@ -755,8 +893,8 @@ class ReconstructedLotReplayTests(unittest.TestCase):
         result = self._run([eurusd, gbpusd], initial_balance=100.0)
         eur_row = next(row for row in result["event_rows"] if row["pair"] == "EURUSD")
 
-        self.assertEqual(eur_row["scaled_volume"], 0.1)
-        self.assertEqual(eur_row["scaled_net_profit"], 10.0)
+        self.assertEqual(eur_row["scaled_volume"], 1.0)
+        self.assertEqual(eur_row["scaled_net_profit"], 100.0)
 
     def test_same_timestamp_out_deals_use_lifo(self):
         start = datetime(2026, 1, 1, 0, 0, 0)
@@ -769,25 +907,25 @@ class ReconstructedLotReplayTests(unittest.TestCase):
                 grid_size=None,
                 max_trades=3,
                 initial_balance=150.0,
-                first_lot=1.0,
-                median_lot=1.0,
+                first_lot=0.15,
+                median_lot=0.16,
                 trade_count=3,
             ),
             deals=[
-                DealEvent(time=start, pair="EURUSD", net_profit=66.6667, volume=1.0, direction="in", sequence_in_pair=0),
-                DealEvent(time=start + timedelta(minutes=1), pair="EURUSD", net_profit=62.5, volume=1.0, direction="in", sequence_in_pair=1),
-                DealEvent(time=start + timedelta(minutes=2), pair="EURUSD", net_profit=0.0, volume=1.0, direction="in", sequence_in_pair=2),
-                DealEvent(time=close_ts, pair="EURUSD", net_profit=10.0, volume=1.0, direction="out", sequence_in_pair=3),
-                DealEvent(time=close_ts, pair="EURUSD", net_profit=10.0, volume=1.0, direction="out", sequence_in_pair=4),
-                DealEvent(time=close_ts, pair="EURUSD", net_profit=10.0, volume=1.0, direction="out", sequence_in_pair=5),
+                DealEvent(time=start, pair="EURUSD", net_profit=66.6667, volume=0.15, direction="in", sequence_in_pair=0),
+                DealEvent(time=start + timedelta(minutes=1), pair="EURUSD", net_profit=62.5, volume=0.16, direction="in", sequence_in_pair=1),
+                DealEvent(time=start + timedelta(minutes=2), pair="EURUSD", net_profit=0.0, volume=0.17, direction="in", sequence_in_pair=2),
+                DealEvent(time=close_ts, pair="EURUSD", net_profit=10.0, volume=0.17, direction="out", sequence_in_pair=3),
+                DealEvent(time=close_ts, pair="EURUSD", net_profit=10.0, volume=0.16, direction="out", sequence_in_pair=4),
+                DealEvent(time=close_ts, pair="EURUSD", net_profit=10.0, volume=0.15, direction="out", sequence_in_pair=5),
             ],
             trades=[
-                TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1000, sequence_in_pair=0),
-                TradeEvent(time=start + timedelta(minutes=1), pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1001, sequence_in_pair=1),
-                TradeEvent(time=start + timedelta(minutes=2), pair="EURUSD", direction="in", side="buy", volume=1.0, price=1.1002, sequence_in_pair=2),
-                TradeEvent(time=close_ts, pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1003, sequence_in_pair=3),
-                TradeEvent(time=close_ts, pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1004, sequence_in_pair=4),
-                TradeEvent(time=close_ts, pair="EURUSD", direction="out", side="buy", volume=1.0, price=1.1005, sequence_in_pair=5),
+                TradeEvent(time=start, pair="EURUSD", direction="in", side="buy", volume=0.15, price=1.1000, sequence_in_pair=0),
+                TradeEvent(time=start + timedelta(minutes=1), pair="EURUSD", direction="in", side="buy", volume=0.16, price=1.1001, sequence_in_pair=1),
+                TradeEvent(time=start + timedelta(minutes=2), pair="EURUSD", direction="in", side="buy", volume=0.17, price=1.1002, sequence_in_pair=2),
+                TradeEvent(time=close_ts, pair="EURUSD", direction="out", side="buy", volume=0.17, price=1.1003, sequence_in_pair=3),
+                TradeEvent(time=close_ts, pair="EURUSD", direction="out", side="buy", volume=0.16, price=1.1004, sequence_in_pair=4),
+                TradeEvent(time=close_ts, pair="EURUSD", direction="out", side="buy", volume=0.15, price=1.1005, sequence_in_pair=5),
             ],
             curve=[],
             baseline_volume_median=1.0,

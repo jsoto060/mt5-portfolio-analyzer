@@ -9,9 +9,15 @@ The analyzer merges deals and balance/equity curves from each pair, simulates on
 - Ingests per-pair MT5 deals reports (closed PnL events).
 - Ingests per-pair MT5 balance-equity curve exports (for floating PnL approximation).
 - Replays all pair deals in one chronological stream on a single shared balance.
-- Applies dynamic lot scaling factor at each event:
+- Calculates an unrounded sizing coefficient for each original opening deal:
 
-	scale factor = (combined balance / initial balance) ^ scale exponent
+	entry risk coefficient = original lot * 100000 / original balance before entry
+
+- Reconstructs each entry lot using the shared portfolio balance at that entry:
+
+	new lot = round(original lot * portfolio balance before entry / original balance before entry, 2)
+
+- Keeps the reconstructed lot fixed after entry for realized PnL, floating PnL, margin, and modeled swap.
 
 - Infers per-pair baseline EA configuration directly from MT5 backtests (single source of truth).
 - Outputs combined balance/equity curve, event log, and performance summary.
@@ -59,22 +65,33 @@ Use JSON config like `config/example_config.json`.
 Key fields:
 
 - `initial_balance`: starting combined account balance.
-- `scale_exponent`: 1.0 for linear scaling, <1.0 for softer scaling, >1.0 for aggressive scaling.
-- `min_scale`: lower clamp for scaling factor.
-- `max_scale`: upper clamp for scaling factor.
+- `scale_exponent`, `min_scale`, `max_scale`: legacy compatibility fields; not applied to per-entry lot sizing.
 - `pairs`: list of pair definitions:
 	- `name`
 	- `deals_file` / `xlsx_file` (required)
 	- `curve_file` (optional)
 	- `market_file` (optional)
 
-Per-pair lot sizing is inferred from MT5 history and replayed as:
+Per-entry lot sizing is inferred from MT5 history and replayed as:
 
-new_lot = round(combined_balance * inferred_risk_percent / 100000, 2)
+new_lot = round(original_lot * combined_balance / original_entry_balance, 2)
+
+The original entry balance starts at the report's initial deposit and follows MT5
+deal-row sequence, including entry commissions, realized profit, and reported swap.
+An entry uses the balance before its own costs are charged. Original entry balances
+are retained when scenario filtering removes trades.
+
+At the same original and reconstructed balance, each entry keeps its original lot.
+This preserves recorded ATR/grid lot progression without selecting a sizing mode.
+
+An existing `risk_percent` scenario override proportionally adjusts every entry's
+coefficient by `scenario risk / baseline median risk`, preserving relative grid sizes.
+The baseline median is rounded to one decimal for reporting only; individual entry
+coefficients are not rounded. A risk override requires a positive baseline median.
 
 The analyzer infers and stores (per pair):
 
-- risk percent
+- median entry sizing coefficient (reported as risk percent, not a stop-loss-based loss percentage)
 - take profit (pips, when inferable)
 - grid size (pips, when inferable)
 - max concurrent trades
@@ -160,7 +177,10 @@ Rationale:
 ## Notes On Approximation
 
 - Closed PnL scaling assumes approximately linear PnL-to-lot behavior.
-- Equity reconstruction uses each pair's historical floating profile sampled from its standalone backtest curve and scaled by the current portfolio scale factor.
+- Equity and margin reconstruction use market prices and the same fixed entry lots as the balance ledger.
+- Closing deals first match a same-side open position with the same remaining original volume. When a match is ambiguous, the newest matching position is used; otherwise, volume is allocated newest-first. Partial closes retain the original entry scale for the remaining position and modeled swap.
+- Volume matching is a heuristic because the reader does not retain an MT5 position identifier. Equal-volume positions cannot always be uniquely matched to their original entries.
+- Per-entry coefficients replay recorded EA decisions; they do not rerun ATR calculations, lot caps, minimum-lot rules, or equity-based/nonlinear sizing under changed conditions.
 - This is a practical portfolio reconstruction approximation, not a tick-level joint re-simulation.
 
 ## Example

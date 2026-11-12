@@ -8,7 +8,7 @@ Input files (per pair):
   - testergraph.report.*.csv -- UTF-16 tab-delimited balance/equity curve.
 
 Dynamic lot scaling:
-    new_lot = round(combined_balance * pair_risk_percent / 100000, 2)
+    new_lot = round(original_lot * combined_balance / original_entry_balance, 2)
 
 Per-pair PnL is multiplied by:
     scale_factor = new_lot / original_lot
@@ -27,7 +27,7 @@ import math
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from statistics import median
 from typing import Dict, List, Optional, Protocol, Tuple, Union
@@ -53,6 +53,7 @@ class DealEvent:
     volume: float
     direction: str = "out"
     sequence_in_pair: int = 0
+    side: str = ""
 
 
 @dataclass
@@ -64,6 +65,7 @@ class TradeEvent:
     price: float
     side: str = ""
     sequence_in_pair: int = 0
+    baseline_balance: Optional[float] = None
 
 
 @dataclass
@@ -135,6 +137,20 @@ class PairData:
             self.curve_times = [p.time for p in self.curve]
             self.curve_floating = [p.equity - p.balance for p in self.curve]
 
+        balance = float(self.baseline_config.initial_balance)
+        ledger = sorted(self.deals, key=lambda event: (event.time, event.sequence_in_pair))
+        ledger_idx = 0
+        annotated_trades = {}
+        for trade in sorted(self.trades, key=lambda event: (event.time, event.sequence_in_pair)):
+            while ledger_idx < len(ledger) and (
+                ledger[ledger_idx].time, ledger[ledger_idx].sequence_in_pair
+            ) < (trade.time, trade.sequence_in_pair):
+                balance += ledger[ledger_idx].net_profit
+                ledger_idx += 1
+            if trade.direction == "in" and trade.baseline_balance is None:
+                annotated_trades[id(trade)] = replace(trade, baseline_balance=balance)
+        self.trades = [annotated_trades.get(id(trade), trade) for trade in self.trades]
+
     def interpolate_floating(self, when: datetime) -> float:
         if not self.curve:
             return 0.0
@@ -183,6 +199,7 @@ class Position:
     original_lot: float
     entry_price: float
     last_price: Optional[float] = None
+    sequence_in_pair: int = 0
 
 
 @dataclass
@@ -192,6 +209,49 @@ class ReconstructedPosition:
     reconstructed_lot: float
     original_lot: float
     entry_time: datetime
+    sequence_in_pair: int = 0
+
+    @property
+    def lots(self) -> float:
+        return self.reconstructed_lot
+
+    @lots.setter
+    def lots(self, value: float) -> None:
+        self.reconstructed_lot = value
+
+
+def _close_positions(
+    positions: Union[List[Position], List[ReconstructedPosition]],
+    original_volume: float,
+    close_side: str = "",
+) -> Tuple[float, List[Tuple[int, float]]]:
+    remaining = max(0.0, original_volume)
+    closed_lots = 0.0
+    allocations: List[Tuple[int, float]] = []
+    open_side = {"sell": "buy", "buy": "sell"}.get(close_side.lower())
+    while remaining > 1e-12 and positions:
+        candidates = [idx for idx, position in enumerate(positions)
+                      if open_side is None or position.side.lower() == open_side]
+        if not candidates:
+            candidates = list(range(len(positions)))
+        index = next((idx for idx in reversed(candidates)
+                      if abs(positions[idx].original_lot - remaining) < 1e-9), candidates[-1])
+        position = positions[index]
+        if position.original_lot <= 1e-12:
+            positions.pop(index)
+            continue
+        closed_original = min(position.original_lot, remaining)
+        reconstructed = position.lots * closed_original / position.original_lot
+        closed_lots += reconstructed
+        allocations.append((position.sequence_in_pair, closed_original))
+        position.lots -= reconstructed
+        position.original_lot -= closed_original
+        remaining -= closed_original
+        if position.original_lot <= 1e-12:
+            positions.pop(index)
+    if remaining > 1e-9:
+        raise ValueError(f"Closing volume exceeds recorded open volume by {remaining}")
+    return closed_lots, allocations
 
 
 @dataclass
@@ -335,10 +395,10 @@ def infer_baseline_config(raw_deals: List[object], initial_balance: float, pair:
 
             open_total = max(0, open_total - 1)
 
-            if deal.balance and deal.balance > 0:
-                balance_before = float(deal.balance)
-            elif balance_before is not None:
-                balance_before += float(deal.profit) + float(deal.commission) + float(deal.swap)
+        if deal.balance and deal.balance > 0:
+            balance_before = float(deal.balance)
+        elif balance_before is not None:
+            balance_before += float(deal.profit) + float(deal.commission) + float(deal.swap)
 
     # Baseline risk is represented at one-decimal precision in legacy backtest setup.
     risk_percent = round(float(median(risk_samples)), 1) if risk_samples else 0.0
@@ -598,11 +658,23 @@ def load_pair(
     raw_deals, inferred_initial_balance = load_xlsx_deals(xlsx_path, include_open=True)
     baseline_config, risk_std = infer_baseline_config(raw_deals, inferred_initial_balance, name)
     if risk_std is not None and risk_std > 0.05:
-        logger.warning(
-            "%s inferred risk std deviation is %.4f%% (> 0.05%%). EA may not use fixed-risk position sizing.",
+        logger.info(
+            "%s entry sizing std deviation is %.4f; per-entry sizing is preserved during replay.",
             name,
             risk_std,
         )
+
+    original_balance = float(inferred_initial_balance)
+    entry_balances: Dict[int, float] = {}
+    for idx, deal in enumerate(raw_deals):
+        if deal.direction == "in":
+            if original_balance <= 0:
+                raise ValueError(f"Original entry balance must be > 0 for {name} at {deal.time}")
+            entry_balances[idx] = original_balance
+        if deal.balance and deal.balance > 0:
+            original_balance = float(deal.balance)
+        else:
+            original_balance += float(deal.profit) + float(deal.commission) + float(deal.swap)
 
     # Preserve MT5 row order as the sequence source for deterministic replay tie-breaks.
     trades = [
@@ -614,6 +686,7 @@ def load_pair(
             volume=d.volume,
             price=d.price,
             sequence_in_pair=idx,
+            baseline_balance=entry_balances.get(idx),
         )
         for idx, d in enumerate(raw_deals)
     ]
@@ -625,6 +698,7 @@ def load_pair(
             volume=d.volume,
             direction="out",
             sequence_in_pair=idx,
+            side=d.side,
         )
         for idx, d in enumerate(raw_deals)
         if d.direction == "out"
@@ -695,20 +769,33 @@ class PositionSizer:
         self.scaling = scaling
 
     @staticmethod
-    def compute_new_lot(pair_data: PairData, combined_balance: float) -> float:
-        """Lot sizing rule requested by user: round(balance * risk% / 100000, 2)."""
+    def compute_new_lot(
+        pair_data: PairData,
+        combined_balance: float,
+        original_lot: float,
+        baseline_balance: Optional[float] = None,
+    ) -> float:
+        """Scale the recorded entry lot by reconstructed/original entry balance."""
         safe_balance = max(0.0, combined_balance)
-        risk_percent = max(0.0, float(pair_data.effective_risk_percent() or 0.0))
-        return round(safe_balance * risk_percent / 100000.0, 2)
+        original_balance = baseline_balance if baseline_balance is not None else pair_data.baseline_config.initial_balance
+        if original_balance <= 0:
+            raise ValueError(f"Original entry balance must be > 0 for {pair_data.name}")
+        risk_multiplier = 1.0
+        if pair_data.scenario_config and pair_data.scenario_config.risk_percent is not None:
+            baseline_risk = pair_data.baseline_config.risk_percent
+            if baseline_risk <= 0:
+                raise ValueError(f"Cannot scale risk override with zero baseline risk for {pair_data.name}")
+            risk_multiplier = max(0.0, pair_data.effective_risk_percent()) / baseline_risk
+        return round(max(0.0, original_lot) * safe_balance / original_balance * risk_multiplier, 2)
 
-    def scale_factor(self, pair_data: PairData, combined_balance: float, original_lot: float) -> float:
-        new_lot = self.compute_new_lot(pair_data, combined_balance)
+    def scale_factor(self, pair_data: PairData, combined_balance: float, original_lot: float, baseline_balance: Optional[float] = None) -> float:
+        new_lot = self.compute_new_lot(pair_data, combined_balance, original_lot, baseline_balance)
         if original_lot <= 0:
             return 0.0
         return new_lot / original_lot
 
-    def scale_volume(self, pair_data: PairData, combined_balance: float, original_lot: float) -> float:
-        return original_lot * self.scale_factor(pair_data, combined_balance, original_lot)
+    def scale_volume(self, pair_data: PairData, combined_balance: float, original_lot: float, baseline_balance: Optional[float] = None) -> float:
+        return self.compute_new_lot(pair_data, combined_balance, original_lot, baseline_balance)
 
 
 class Broker(Protocol):
@@ -1071,19 +1158,22 @@ class PortfolioSimulator:
             for pair_data in self.pairs_data
         }
         entry_lot_by_trade: Dict[Tuple[str, int], float] = {}
+        self._entry_lots: Dict[int, float] = {}
 
         if self.swap_engine is not None:
             self.swap_engine.reset()
 
         def process_in_trade(trade: TradeEvent) -> None:
             pair_data = pairs_by_name[trade.pair]
-            new_lot = self.sizer.compute_new_lot(pair_data, balance)
+            new_lot = self.sizer.compute_new_lot(pair_data, balance, trade.volume, trade.baseline_balance)
+            self._entry_lots[id(trade)] = new_lot
             open_positions[trade.pair].append(ReconstructedPosition(
                 pair=trade.pair,
                 side=trade.side,
                 reconstructed_lot=new_lot,
                 original_lot=max(0.0, float(trade.volume)),
                 entry_time=trade.time,
+                sequence_in_pair=trade.sequence_in_pair,
             ))
             entry_lot_by_trade[(trade.pair, int(trade.sequence_in_pair))] = new_lot
             if self.swap_engine is not None:
@@ -1126,6 +1216,9 @@ class PortfolioSimulator:
             chosen_type, chosen_key = self._pick_next_ledger_kind(deal_key, swap_key)
 
             while in_trade_idx < len(in_trades) and self._trade_order_key(in_trades[in_trade_idx]) <= chosen_key[:3]:
+                pending_swap_key = next_swap_event_key()
+                if pending_swap_key is not None and pending_swap_key[:3] <= self._trade_order_key(in_trades[in_trade_idx]):
+                    break
                 process_in_trade(in_trades[in_trade_idx])
                 in_trade_idx += 1
 
@@ -1176,7 +1269,7 @@ class PortfolioSimulator:
             if event.direction == "in":
                 new_lot = entry_lot_by_trade.get((event.pair, int(event.sequence_in_pair)))
                 if new_lot is None:
-                    new_lot = self.sizer.compute_new_lot(pair_data, balance)
+                    new_lot = self.sizer.compute_new_lot(pair_data, balance, event.volume)
                     open_positions[event.pair].append(ReconstructedPosition(
                         pair=event.pair,
                         side="buy",
@@ -1195,12 +1288,14 @@ class PortfolioSimulator:
                         )
             else:
                 if open_positions[event.pair]:
-                    closed_pos = open_positions[event.pair].pop()
-                    new_lot = closed_pos.reconstructed_lot
+                    new_lot, allocations = _close_positions(
+                        open_positions[event.pair], event.volume, event.side,
+                    )
                     if self.swap_engine is not None:
-                        self.swap_engine.close_latest_position(event.pair)
+                        for sequence, original_volume in allocations:
+                            self.swap_engine.close_position_volume(event.pair, sequence, original_volume)
                 else:
-                    new_lot = self.sizer.compute_new_lot(pair_data, balance)
+                    new_lot = self.sizer.compute_new_lot(pair_data, balance, event.volume)
 
             total_scale = (new_lot / event.volume) if event.volume > 0 else 0.0
             scaled_pnl = event.net_profit * total_scale
@@ -1226,6 +1321,10 @@ class PortfolioSimulator:
                 "CumulativeModeledSwap": round(cumulative_modeled_swap, 4),
                 "BalanceAfterEvent": round(balance, 4),
             })
+
+        while in_trade_idx < len(in_trades):
+            process_in_trade(in_trades[in_trade_idx])
+            in_trade_idx += 1
 
         return balance, balance_checkpoints, event_rows, pair_pnl
 
@@ -1258,12 +1357,8 @@ class PortfolioSimulator:
 
             while trade_idx < len(all_trade_events) and all_trade_events[trade_idx].time <= ts:
                 trade = all_trade_events[trade_idx]
-                trade_pair = pairs_by_name[trade.pair]
-
                 if trade.direction == "in":
-                    trade_bal_idx = bisect.bisect_right(checkpoint_times, trade.time) - 1
-                    trade_balance = balance_checkpoints[max(trade_bal_idx, 0)][1]
-                    scaled_volume = self.sizer.scale_volume(trade_pair, trade_balance, trade.volume)
+                    scaled_volume = self._entry_lots[id(trade)]
                     positions[trade.pair].append(Position(
                         pair=trade.pair,
                         side=trade.side,
@@ -1271,25 +1366,11 @@ class PortfolioSimulator:
                         original_lot=max(0.0, float(trade.volume)),
                         entry_price=trade.price,
                         last_price=trade.price if trade.price > 0 else None,
+                        sequence_in_pair=trade.sequence_in_pair,
                     ))
                 elif trade.direction == "out":
-                    remaining_original = max(0.0, float(trade.volume))
-                    # Close reconstructed positions in MT5-matching LIFO order.
-                    pair_positions = positions[trade.pair]
-                    while remaining_original > 1e-12 and pair_positions:
-                        open_pos = pair_positions[-1]
-                        open_original = max(0.0, open_pos.original_lot)
-                        if open_original <= 1e-12 or open_pos.lots <= 1e-12:
-                            pair_positions.pop()
-                            continue
-
-                        close_original = min(open_original, remaining_original)
-                        close_ratio = close_original / open_original if open_original > 0 else 0.0
-                        open_pos.lots -= open_pos.lots * close_ratio
-                        open_pos.original_lot -= close_original
-                        remaining_original -= close_original
-                        if open_pos.original_lot <= 1e-12 or open_pos.lots <= 1e-12:
-                            pair_positions.pop()
+                    if positions[trade.pair]:
+                        _close_positions(positions[trade.pair], trade.volume, trade.side)
 
                 if trade.price > 0:
                     for open_pos in positions[trade.pair]:
